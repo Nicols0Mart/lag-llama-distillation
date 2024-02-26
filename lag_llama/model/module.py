@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Sequence, Iterable
 
 import torch
 from gluonts.torch.scaler import MeanScaler, NOPScaler, StdScaler
@@ -15,6 +15,7 @@ from gluonts.torch.distributions import DistributionOutput
 
 @dataclass
 class LTSMConfig:
+    # feature_size: int = 3 + 6 + 2  # target + loc + scale + time features
     feature_size: int = 3 + 6  # target + loc + scale + time features
     block_size: int = 2048
     n_layer: int = 32
@@ -426,7 +427,8 @@ class LagLlamaModel(nn.Module):
         self.context_length = context_length
         self.lags_seq = lags_seq
         if time_feat:
-            feature_size = input_size * (len(self.lags_seq)) + 2 * input_size + 6
+            # feature_size = input_size * (len(self.lags_seq)) + 2 * input_size + 6
+            feature_size = 94
         else:
             feature_size = input_size * (len(self.lags_seq)) + 2 * input_size
 
@@ -546,7 +548,7 @@ class LagLlamaModel(nn.Module):
         future_time_feat: Optional[torch.Tensor] = None,
         future_target: Optional[torch.Tensor] = None,
         use_kv_cache: bool = False,
-    ) -> torch.Tensor:
+    ) -> Iterable[torch.Tensor]:
         # if past_time_feat is not None:
         transformer_input, loc, scale = self.prepare_input(
             past_target=past_target,
@@ -575,7 +577,7 @@ class LagLlamaModel(nn.Module):
         params = self.param_proj(
             x
         )  # (bsz, context_length+(pred_len-1)) ; (bsz, context_length+(pred_len-1))
-        return params, loc, scale
+        return params, loc, scale # (torch.Size([3200, 32]), torch.Size([3200, 32]), torch.Size([3200, 32])), torch.Size([3200, 1]), torch.Size([3200, 1])
 
     def reset_cache(self) -> None:
         """

@@ -36,6 +36,182 @@ from gluon_utils.gluon_ts_distributions.implicit_quantile_network import (
 
 from lag_llama.model.module import LagLlamaModel
 
+from dataclasses import dataclass, field
+from functools import reduce
+from typing import Callable, Dict, List, Optional, Tuple, Union
+from peft import LoraConfig, get_peft_model
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset
+
+from peft.tuners import lora
+from transformers import Trainer, TrainingArguments
+from transformers.data.data_collator import DataCollator
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
+from transformers.trainer import (EvalPrediction, PreTrainedModel,
+                                  PreTrainedTokenizerBase, TrainerCallback)
+from transformers.trainer_pt_utils import get_parameter_names
+from transformers.utils import is_sagemaker_mp_enabled, logging
+
+if is_sagemaker_mp_enabled():
+    import smdistributed.modelparallel.torch as smp
+
+logger = logging.get_logger(__name__)
+
+@dataclass
+class LoraPlusTrainingArguments(TrainingArguments):
+    do_train: bool = field(default=True, metadata={"help": "Whether to run training."})
+    do_eval: bool = field(
+        default=True, metadata={"help": "Whether to run eval on the dev set."}
+    )
+    keep_checkpoints: str = field(
+        default="all",
+        metadata={"help": "keep all, eval, or none checkpoints after end of training"},
+    )
+    lora_rank: int = field(default=8, metadata={"help": "LoRA rank r"})
+    lora_alpha: float = field(default=16, metadata={"help": "LoRA alpha parameter"})
+    lora_dropout: float = field(
+        default=0.1, metadata={"help": "dropout rate for LoRA modules"}
+    )
+    target_modules: Optional[str] = field(
+        default=None, metadata={"help": "which modules to add LoRA layer to"}
+    )
+    use_lora: bool = field(
+        default=True, metadata={"help": "whether to finetune using LoRA"}
+    )
+    lora_use_original_init: bool = field(
+        default=False,
+        metadata={"help": "whether to use the original LoRA initialization"},
+    )
+    bf16: bool = field(default=False, metadata={"help": "use bfloat16"})
+    fp16: bool = field(default=False, metadata={"help": "use bfloat16"})
+    gradient_checkpointing: bool = field(
+        default=False, metadata={"help": "use gradient checkpointing"}
+    )
+    loraplus_lr_ratio: Optional[float] = field(
+        default=None, metadata={"help": "loraplus learning rate ratio lr_B / lr_A."}
+    )
+    loraplus_lr_embedding: Optional[float] = field(
+        default=1e-6, metadata={"help": "loraplus learning rate for lora embedding layers."}
+    )
+
+
+def get_module(name, opt_model):
+    """
+    Get the module from the given name in the optimized model.
+
+    Args:
+        name (str): The name of the module.
+        opt_model: The optimized model.
+
+    Returns:
+        module: The module corresponding to the given name in the optimized model.
+    """
+    parent_idx = 2 if "lora" in name else 1
+    module_names = name.split(sep=".")[:-parent_idx]
+    module = reduce(getattr, module_names, opt_model)
+    return module
+
+def create_loraplus_optimizer(
+    opt_model,
+    optimizer_cls,
+    optimizer_kwargs,
+    loraplus_lr_ratio,
+    loraplus_lr_embedding=None,
+):
+    """
+    Creates an optimizer for the given model, applying LoRA-specific learning rate adjustments to different parameter groups.
+    
+    Args:
+        opt_model (torch.nn.Module): The model for which the optimizer is being created.
+        optimizer_cls (class): The class of the optimizer to be used (e.g., torch.optim.Adam).
+        optimizer_kwargs (dict): A dictionary of keyword arguments for the optimizer's initialization.
+        loraplus_lr_ratio (float): The learning rate ratio to be applied to LoRA parameters.
+        loraplus_lr_embedding (float, optional): A specific learning rate for embedding parameters, with a default value if not provided.
+    
+    Returns:
+        An instance of the specified optimizer class configured with the model's parameters organized into groups with custom learning rates.
+    """
+
+    assert loraplus_lr_ratio is not None, "loraplus_lr_ratio must be provided."
+
+    if loraplus_lr_embedding is None:
+        loraplus_lr_embedding = 1e-6
+
+    decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
+    decay_parameters = [name for name in decay_parameters if "bias" not in name]
+    param_groups = {
+        "groupA": {},
+        "groupB": {},
+        "groupB_no_decay": {},
+        "embedding": {},
+    }
+
+    for name, param in opt_model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        module = get_module(name, opt_model)
+        if isinstance(module, lora.Embedding):
+            param_groups["embedding"][name] = param
+        elif "lora_B" in name or param.ndim == 1:
+            if name in decay_parameters:
+                param_groups["groupB"][name] = param
+            else:
+                param_groups["groupB_no_decay"][name] = param
+        else:
+            param_groups["groupA"][name] = param
+
+    assigned_param_groups = ""
+    for group in param_groups:
+        assigned_param_groups += f"{group}\n {list(param_groups[group].keys())}\n\n"
+    logger.debug(assigned_param_groups)
+
+    lr = optimizer_kwargs["lr"]
+    weight_decay = optimizer_kwargs.get("weight_decay", 0.0)
+
+    optimizer_grouped_parameters = [
+        {
+            "params": list(param_groups["groupA"].values()),
+            "weight_decay": weight_decay,
+            "lr": lr,
+        },
+        {
+            "params": list(param_groups["embedding"].values()),
+            "weight_decay": weight_decay,
+            "lr": loraplus_lr_embedding,
+        },
+        {
+            "params": list(param_groups["groupB"].values()),
+            "weight_decay": weight_decay,
+            "lr": lr * loraplus_lr_ratio,
+        },
+        {
+            "params": list(param_groups["groupB_no_decay"].values()),
+            "weight_decay": 0.0,
+            "lr": lr * loraplus_lr_ratio,
+        },
+    ]
+
+    optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+    if optimizer_cls.__name__ == "Adam8bit":
+        import bitsandbytes
+
+        manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+
+        skipped = 0
+        for module in opt_model.modules():
+            if isinstance(module, nn.Embedding):
+                skipped += sum(
+                    {p.data_ptr(): p.numel() for p in module.parameters()}.values()
+                )
+                logger.info(f"skipped {module}: {skipped/2**20}M params")
+                manager.register_module_override(module, "weight", {"optim_bits": 32})
+                logger.debug(f"bitsandbytes: will optimize {module} in fp32")
+        logger.info(f"skipped: {skipped/2**20}M params")
+
+    return optimizer
+
 
 class LagLlamaLightningModule(pl.LightningModule):
     """
@@ -57,6 +233,22 @@ class LagLlamaLightningModule(pl.LightningModule):
     weight_decay
         Weight decay regularization parameter, default: ``1e-8``.
     """
+
+    def print_trainable_parameters(self, model):
+        """
+        Prints the number of trainable parameters in the model.
+        """
+        trainable_params = 0
+        all_param = 0
+        for name, param in model.named_parameters():
+            if "lora" in name:
+                print(name, param)
+            all_param += param.numel()
+            if param.requires_grad:
+                trainable_params += param.numel()
+        print(
+            f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}"
+        )
 
     @validated()
     def __init__(
@@ -99,7 +291,18 @@ class LagLlamaLightningModule(pl.LightningModule):
         self.save_hyperparameters()
         self.context_length = self.hparams.context_length
         self.prediction_length = self.hparams.prediction_length
-        self.model = LagLlamaModel(**self.hparams.model_kwargs)
+        model = LagLlamaModel(**self.hparams.model_kwargs)
+        config = LoraConfig(
+                r=16,
+                lora_alpha=16,
+                target_modules=["q_proj", "kv_proj"],
+                lora_dropout=0.1,
+                # use_original_init=False,
+                bias="none",
+                modules_to_save=["classifier"],
+            )
+        lora_model = get_peft_model(model, config)
+        self.model = lora_model
         self.loss = self.hparams.loss
         self.lr = self.hparams.lr
         self.weight_decay = self.hparams.weight_decay
@@ -418,7 +621,7 @@ class LagLlamaLightningModule(pl.LightningModule):
         for key, value in self.train_loss_dict.items():
             loss_avg = np.mean(value)
             self.log(
-                f"train_loss_avg_per_train_dataset/{self.data_id_to_name_map[key]}",
+                f"train_loss_avg_per_train_dataset/{key}",
                 loss_avg,
                 on_epoch=True,
                 on_step=False,
@@ -483,7 +686,7 @@ class LagLlamaLightningModule(pl.LightningModule):
             loss_avg = np.mean(value)
             if key >= 0:
                 self.log(
-                    f"val_loss_avg_per_train_dataset/{self.data_id_to_name_map[key]}",
+                    f"val_loss_avg_per_train_dataset/{key}",
                     loss_avg,
                     on_epoch=True,
                     on_step=False,
@@ -491,7 +694,7 @@ class LagLlamaLightningModule(pl.LightningModule):
                 )
             else:
                 self.log(
-                    f"val_loss_avg_per_test_dataset/{self.data_id_to_name_map[key]}",
+                    f"val_loss_avg_per_test_dataset/{key}",
                     loss_avg,
                     on_epoch=True,
                     on_step=False,
@@ -518,9 +721,17 @@ class LagLlamaLightningModule(pl.LightningModule):
         """
         Returns the optimizer to use.
         """
-        optimizer = torch.optim.Adam(
-            self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
+        # optimizer = torch.optim.Adam(
+        #     self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
+        # )
+        optimizer = create_loraplus_optimizer(
+            self.model,
+            optimizer_cls=torch.optim.Adam,
+            optimizer_kwargs={"lr": self.lr, "weight_decay": self.weight_decay},
+            loraplus_lr_embedding=1e-06,
+            loraplus_lr_ratio=1.25,
         )
+
         if self.use_cosine_annealing_lr:
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, **self.cosine_annealing_lr_args, verbose=True

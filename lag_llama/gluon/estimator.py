@@ -26,9 +26,11 @@ from gluonts.transform import (
     TestSplitSampler,
     Transformation,
     ValidationSplitSampler,
+    VstackFeatures
 )
 
-from gluonts.torch.distributions import StudentTOutput
+from gluonts.torch.model.deepar import DeepAREstimator
+from gluonts.torch.distributions import StudentTOutput, NormalOutput
 from gluon_utils.gluon_ts_distributions.implicit_quantile_network import (
     ImplicitQuantileNetworkOutput,
 )
@@ -140,6 +142,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
         cosine_annealing_lr_args: dict = {},
         track_loss_per_series: bool = False,
         ckpt_path: Optional[str] = None,
+        use_feat_dynamic_real=True,
     ) -> None:
         default_trainer_kwargs = {"max_epochs": 100}
         if trainer_kwargs is not None:
@@ -160,7 +163,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
 
         if len(lag_indices):
             self.lags_seq = sorted(set(lag_indices))
-            self.lags_seq = [lag_index - 1 for lag_index in self.lags_seq]
+            self.lags_seq = [lag_index - 1 for lag_index in self.lags_seq] # len 83, max: 1092
         else:
             self.lags_seq = []
 
@@ -178,8 +181,8 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
         self.distr_output = distr_output
         self.num_parallel_samples = num_parallel_samples
         self.loss = loss
-        self.batch_size = batch_size
-        self.num_batches_per_epoch = num_batches_per_epoch
+        self.batch_size = batch_size # 32
+        self.num_batches_per_epoch = num_batches_per_epoch # 50
 
         self.train_sampler = train_sampler or ExpectedNumInstanceSampler(
             num_instances=1.0, min_future=prediction_length
@@ -238,8 +241,12 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                         start_field=FieldName.START,
                         target_field=FieldName.TARGET,
                         output_field=FieldName.FEAT_TIME,
-                        time_features=time_features_from_frequency_str("S"),
+                        time_features=time_features_from_frequency_str("5T"),
                         pred_length=self.prediction_length,
+                    ),
+                    VstackFeatures(
+                        output_field=FieldName.FEAT_TIME,
+                        input_fields=[FieldName.FEAT_TIME] + [FieldName.FEAT_DYNAMIC_REAL]
                     ),
                     # FilterTransformation(lambda x: sum(abs(x[FieldName.TARGET])) > 0),
                     AddObservedValuesIndicator(
@@ -247,6 +254,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                         output_field=FieldName.OBSERVED_VALUES,
                         imputation_method=DummyValueImputation(0.0),
                     ),
+                    
                 ]
             )
         else:
@@ -393,6 +401,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                 shuffle_buffer_length=shuffle_buffer_length,
                 field_names=TRAINING_INPUT_NAMES
                 + ["past_time_feat", "future_time_feat", "data_id", "item_id"],
+                # + ["past_time_feat", "future_time_feat"],
                 output_type=torch.tensor,
                 num_batches_per_epoch=self.num_batches_per_epoch,
             )
@@ -402,6 +411,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                 instances,
                 batch_size=self.batch_size,
                 shuffle_buffer_length=shuffle_buffer_length,
+                # field_names=TRAINING_INPUT_NAMES,
                 field_names=TRAINING_INPUT_NAMES + ["data_id", "item_id"],
                 output_type=torch.tensor,
                 num_batches_per_epoch=self.num_batches_per_epoch,
@@ -422,6 +432,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                 batch_size=self.batch_size,
                 field_names=TRAINING_INPUT_NAMES
                 + ["past_time_feat", "future_time_feat", "data_id", "item_id"],
+                # + ["past_time_feat", "future_time_feat"],
                 output_type=torch.tensor,
             )
         else:
@@ -429,6 +440,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                 instances,
                 batch_size=self.batch_size,
                 field_names=TRAINING_INPUT_NAMES + ["data_id", "item_id"],
+                # field_names=TRAINING_INPUT_NAMES,
                 output_type=torch.tensor,
             )
 
