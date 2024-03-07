@@ -427,8 +427,8 @@ class LagLlamaModel(nn.Module):
         self.context_length = context_length
         self.lags_seq = lags_seq
         if time_feat:
-            # feature_size = input_size * (len(self.lags_seq)) + 2 * input_size + 6
-            feature_size = 94
+            feature_size = input_size * (len(self.lags_seq)) + 2 * input_size + 6
+            # feature_size = 94
         else:
             feature_size = input_size * (len(self.lags_seq)) + 2 * input_size
 

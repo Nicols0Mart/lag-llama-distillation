@@ -1,6 +1,7 @@
 # Following code is to import from the parent directory (for augmentation)
 import inspect
 import os
+from pathlib import Path
 import sys
 
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
@@ -35,16 +36,15 @@ from gluon_utils.gluon_ts_distributions.implicit_quantile_network import (
 )
 
 from lag_llama.model.module import LagLlamaModel
-
+from peft.tuners import lora
 from dataclasses import dataclass, field
 from functools import reduce
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import IO, Any, Callable, Dict, List, Optional, Tuple, Union
 from peft import LoraConfig, get_peft_model
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 
-from peft.tuners import lora
 from transformers import Trainer, TrainingArguments
 from transformers.data.data_collator import DataCollator
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
@@ -52,6 +52,7 @@ from transformers.trainer import (EvalPrediction, PreTrainedModel,
                                   PreTrainedTokenizerBase, TrainerCallback)
 from transformers.trainer_pt_utils import get_parameter_names
 from transformers.utils import is_sagemaker_mp_enabled, logging
+
 
 if is_sagemaker_mp_enabled():
     import smdistributed.modelparallel.torch as smp
@@ -291,18 +292,9 @@ class LagLlamaLightningModule(pl.LightningModule):
         self.save_hyperparameters()
         self.context_length = self.hparams.context_length
         self.prediction_length = self.hparams.prediction_length
-        model = LagLlamaModel(**self.hparams.model_kwargs)
-        config = LoraConfig(
-                r=16,
-                lora_alpha=16,
-                target_modules=["q_proj", "kv_proj"],
-                lora_dropout=0.1,
-                # use_original_init=False,
-                bias="none",
-                modules_to_save=["classifier"],
-            )
-        lora_model = get_peft_model(model, config)
-        self.model = lora_model
+        model = LagLlamaModel(**self.hparams.model_kwargs)        
+        # lora_model = model
+        self.model = model
         self.loss = self.hparams.loss
         self.lr = self.hparams.lr
         self.weight_decay = self.hparams.weight_decay
@@ -472,6 +464,7 @@ class LagLlamaLightningModule(pl.LightningModule):
             (-1, self.model.num_parallel_samples, self.prediction_length)
             + self.model.distr_output.event_shape,
         )
+
 
     # train
     def _compute_loss(self, batch, do_not_average=False, return_observed_values=False):
