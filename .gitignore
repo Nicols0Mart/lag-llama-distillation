@@ -172,3 +172,6 @@ data/datasets
 hyperparameters_lag_transformer
 lightning_logs/
 *.png
+results/pems_2_metr_top2/video_1713878073.199974_re.mp4
+results/pems_2_metr_top2/video_1713878073.199974.mp4
+*.np[yz]

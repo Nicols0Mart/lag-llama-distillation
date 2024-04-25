@@ -427,7 +427,7 @@ class LagLlamaModel(nn.Module):
         self.context_length = context_length
         self.lags_seq = lags_seq
         if time_feat:
-            feature_size = input_size * (len(self.lags_seq)) + 2 * input_size + 6
+            feature_size = input_size * (len(self.lags_seq)) + 2 * input_size + 5
             # feature_size = 94
         else:
             feature_size = input_size * (len(self.lags_seq)) + 2 * input_size
@@ -441,6 +441,7 @@ class LagLlamaModel(nn.Module):
             rope_scaling=rope_scaling,
             dropout=dropout,
         )
+        self.config = config
         self.num_parallel_samples = num_parallel_samples
 
         if scaling == "mean":
@@ -587,3 +588,100 @@ class LagLlamaModel(nn.Module):
         for block in self.transformer.h:
             block.y_cache = None
             block.attn.kv_cache = None
+
+
+class LagLlamaSeqToSeq(LagLlamaModel):
+    def forward(
+        self,
+        past_target: torch.Tensor,
+        past_observed_values: torch.Tensor,
+        past_time_feat: Optional[torch.Tensor] = None,
+        future_time_feat: Optional[torch.Tensor] = None,
+        future_target: Optional[torch.Tensor] = None,
+        use_kv_cache: bool = False,
+    ) -> Iterable[torch.Tensor]:
+        # if past_time_feat is not None:
+        transformer_input, loc, scale = self.prepare_input(
+            past_target=past_target,
+            past_observed_values=past_observed_values,
+            future_target=future_target,
+            past_time_feat=past_time_feat,
+            future_time_feat=future_time_feat,
+        )  # return: (bsz, context_length+(pred_len-1), len(self.lags_seq) + 2); (bsz, 1); (bsz, 1)
+        # To use kv cache for inference and pass recent token to transformer
+        if use_kv_cache and self.y_cache:
+            # Only use the most recent one, rest is in cache
+            transformer_input = transformer_input[:, -1:]
+
+        # forward the LLaMA model itself
+        x = self.transformer.wte(
+            transformer_input
+        )  # token embeddings of shape (b, t, n_embd_per_head*n_head) # (bsz, context_length+(pred_len-1), n_embd_per_head*n_head)
+        for block in self.transformer.h:
+            x = block(x, use_kv_cache)
+        latent_x = x
+        x = self.transformer.ln_f(
+            x
+        )  # (bsz, context_length+(pred_len-1), n_embd_per_head*n_head)
+        if use_kv_cache:
+            self.y_cache = True
+        params = self.param_proj(
+            x
+        )  # (bsz, context_length+(pred_len-1)) ; (bsz, context_length+(pred_len-1))
+        return params, loc, scale, latent_x  # (torch.Size([3200, 32]), torch.Size([3200, 32]), torch.Size([3200, 32])), torch.Size([3200, 1]), torch.Size([3200, 1])
+
+class LagLlamaDAModel(nn.Module):
+    def __init__(
+        self,
+        context_length: int,
+        max_context_length: int,
+        scaling: str,
+        input_size: int,
+        n_layer: int,
+        n_embd_per_head: int,
+        n_head: int,
+        lags_seq: List[int],
+        distr_output: DistributionOutput,
+        rope_scaling=None,
+        num_parallel_samples: int = 100,
+        time_feat: bool = True,
+        dropout: float = 0.0,
+    ) -> None:
+        """
+        Domain adaptation model for LLaMA. This model is used to adapt the LLaMA model to a new dataset. MMD loss is used to align the source and target domains.
+        """
+        super().__init__()
+        self.feature_extractor = LagLlamaSeqToSeq(
+            context_length=context_length,
+            max_context_length=max_context_length,
+            scaling=scaling,
+            input_size=input_size,
+            n_layer=n_layer,
+            n_embd_per_head=n_embd_per_head,
+            n_head=n_head,
+            lags_seq=lags_seq,
+            distr_output=distr_output,
+            rope_scaling=rope_scaling,
+            num_parallel_samples=num_parallel_samples,
+            time_feat=time_feat,
+            dropout=dropout,
+        )
+        self.domain_classifier = nn.Sequential(
+            nn.Linear(n_layer * n_embd_per_head * n_head, 100),
+            nn.ReLU(),
+            nn.Linear(100, 100),
+            nn.ReLU(),
+            nn.Linear(100, 2),
+        )
+    
+    def forward(self,
+                past_target: torch.Tensor,
+                past_observed_values: torch.Tensor,
+                past_time_feat: Optional[torch.Tensor] = None,
+                future_time_feat: Optional[torch.Tensor] = None,
+                future_target: Optional[torch.Tensor] = None,
+                use_kv_cache: bool = False,
+                ):
+        params, loc, scale, latent = self.feature_extractor(past_target, past_observed_values, past_time_feat, future_time_feat, future_target, use_kv_cache)
+        domain_logits = self.domain_classifier(latent)
+        return params, loc, scale, domain_logits
