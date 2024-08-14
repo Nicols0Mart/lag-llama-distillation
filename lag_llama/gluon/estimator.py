@@ -476,7 +476,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
             "dropout": self.dropout,
         }
         if self.ckpt_path is not None and use_lora:
-            with lora(r=4, alpha=16, dropout=0.05, enabled=True):
+            with lora(r=8, alpha=16, dropout=0.05, enabled=True):
                 module = LagLlamaLightningModule.load_from_checkpoint(
                     checkpoint_path=self.ckpt_path,
                     strict=False,
@@ -765,7 +765,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
 
         custom_callbacks = self.trainer_kwargs.get("callbacks", [])
         callbacks = [checkpoint] + custom_callbacks
-        trainer_kwargs = {**self.trainer_kwargs, "callbacks": callbacks}
+        trainer_kwargs = {**self.trainer_kwargs, "callbacks": callbacks, "precision": "bf16-mixed"}
         trainer = pl.Trainer(**trainer_kwargs)
         training_network.strict_loading = False
         trainer.fit(

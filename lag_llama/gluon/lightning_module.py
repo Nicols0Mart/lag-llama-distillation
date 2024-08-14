@@ -3,7 +3,7 @@ import inspect
 import os
 from pathlib import Path
 import sys
-
+from setuptools import setup, Extension
 from lag_llama.model import losses
 
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
@@ -488,6 +488,7 @@ class LagLlamaLightningModule(pl.LightningModule):
         )  # (bsz* self.model.num_parallel_samples, model.context_length+max(model.lags_seq))
 
         future_samples = []
+        embs = []
         for t in range(self.prediction_length):
             if self.time_feat:
                 params, loc, scale = self.model(
@@ -498,6 +499,7 @@ class LagLlamaLightningModule(pl.LightningModule):
                     past_observed_values=repeated_past_observed_values,
                     use_kv_cache=self.use_kv_cache,
                 )
+                # embs.append(emb.cpu().deqtach())
             else:
                 params, loc, scale = self.model(
                     *args,

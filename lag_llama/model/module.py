@@ -3,14 +3,15 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Iterable
 
 import torch
+from fairscale.nn.model_parallel.initialize import initialize_model_parallel
 from gluonts.torch.scaler import MeanScaler, NOPScaler, StdScaler
 from gluonts.torch.util import lagged_sequence_values, unsqueeze_expand
 from torch import nn
 from torch.nn import functional as F
-
 from gluon_utils.scalers.robust_scaler import RobustScaler
 from gluonts.torch.distributions import DistributionOutput
 
+from .llama3 import TransformerBlock, FeedForward as FeedForward3, RMSNorm as RMSNorm3
 
 
 @dataclass
@@ -23,6 +24,35 @@ class LTSMConfig:
     n_embd_per_head: int = 128
     rope_scaling: Optional[dict] = None
     dropout: float = 0.0
+
+
+@dataclass
+class ModelArgs:
+    dim: int = 4096
+    n_layers: int = 32
+    n_heads: int = 32
+    n_kv_heads: Optional[int] = None
+    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
+    ffn_dim_multiplier: Optional[float] = None
+    norm_eps: float = 1e-5
+    rope_theta: float = 500000
+
+    max_batch_size: int = 32
+    max_seq_len: int = 2048
+
+
+def llama2_to_3_adaptor(llama2_config: LTSMConfig) -> ModelArgs:
+    return ModelArgs(
+        dim=llama2_config.n_embd_per_head * llama2_config.n_head,
+        n_layers=llama2_config.n_layer,
+        n_heads=llama2_config.n_head,
+        multiple_of=256,
+        ffn_dim_multiplier=None,
+        norm_eps=1e-5,
+        rope_theta=500000,
+        max_batch_size=32,
+        max_seq_len=2048,
+    )
 
 
 def scaled_dot_product_attention(
@@ -63,6 +93,7 @@ class Block(nn.Module):
         x = x + self.attn(self.rms_1(x), use_kv_cache)
         y = x + self.mlp(self.rms_2(x))
         return y
+    
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
@@ -457,7 +488,6 @@ class LagLlamaModel(nn.Module):
         self.param_proj = self.distr_output.get_args_proj(
             config.n_embd_per_head * config.n_head
         )
-
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Linear(
@@ -570,6 +600,7 @@ class LagLlamaModel(nn.Module):
 
         for block in self.transformer.h:
             x = block(x, use_kv_cache)
+        transformer_output = x
         x = self.transformer.ln_f(
             x
         )  # (bsz, context_length+(pred_len-1), n_embd_per_head*n_head)
