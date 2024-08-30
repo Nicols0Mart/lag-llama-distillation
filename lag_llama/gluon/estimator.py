@@ -29,6 +29,7 @@ from gluonts.transform import (
     DummyValueImputation,
     ExpectedNumInstanceSampler,
     InstanceSampler,
+    AsNumpyArray,
     InstanceSplitter,
     TestSplitSampler,
     Transformation,
@@ -63,6 +64,8 @@ class TrainOutput(NamedTuple):
     predictor: PyTorchPredictor
 
 PREDICTION_INPUT_NAMES = [
+    #TODO: add lpls features
+    "feat_static_real",
     "past_target",
     "past_observed_values",
 ]
@@ -274,9 +277,9 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
         lr: float = 1e-3,
         weight_decay: float = 1e-8,
         # Augmentations arguments
-        aug_prob: float = 0.1,
-        freq_mask_rate: float = 0.1,
-        freq_mixing_rate: float = 0.1,
+        aug_prob: float = 0.5,
+        freq_mask_rate: float = 0.5,
+        freq_mixing_rate: float = 0.25,
         jitter_prob: float = 0.0,
         jitter_sigma: float = 0.03,
         scaling_prob: float = 0.0,
@@ -314,6 +317,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
         track_loss_per_series: bool = False,
         ckpt_path: Optional[str] = None,
         use_feat_dynamic_real=True,
+        mistral=False,
     ) -> None:
         default_trainer_kwargs = {"max_epochs": 100}
         if trainer_kwargs is not None:
@@ -321,6 +325,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
         super().__init__(trainer_kwargs=default_trainer_kwargs)
 
         self.scaling = scaling
+        self.mistral=mistral
         self.input_size = input_size
         self.prediction_length = prediction_length
         self.context_length = context_length
@@ -420,6 +425,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
 
         return {
             "num_feat_dynamic_real": stats.num_feat_dynamic_real,
+            "num_feat_static_real": stats.feat_static_real,
             "num_feat_static_cat": len(stats.feat_static_cat),
             "cardinality": [len(cats) for cats in stats.feat_static_cat],
         }
@@ -445,7 +451,16 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                         output_field=FieldName.OBSERVED_VALUES,
                         imputation_method=DummyValueImputation(0.0),
                     ),
-                    
+                    AsNumpyArray(
+                        field=FieldName.FEAT_STATIC_REAL,
+                        expected_ndim=1,
+                        dtype=int,
+                    ),
+                    # AsNumpyArray(
+                    #     field=FieldName.FEAT_DYNAMIC_REAL,
+                    #     expected_ndim=2,
+                    #     dtype=int,
+                    # ),
                 ]
             )
         else:
@@ -514,6 +529,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                     use_cosine_annealing_lr=self.use_cosine_annealing_lr,
                     cosine_annealing_lr_args=self.cosine_annealing_lr_args,
                     track_loss_per_series=self.track_loss_per_series,
+                    mistral=self.mistral,
                 )
                 module.print_trainable_parameters(module.model)
                 return module
@@ -555,6 +571,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                     use_cosine_annealing_lr=self.use_cosine_annealing_lr,
                     cosine_annealing_lr_args=self.cosine_annealing_lr_args,
                     track_loss_per_series=self.track_loss_per_series,
+                    mistral=self.mistral,
                 )
             # for param in module.model.parameters():
             #     param.requires_grad = False
@@ -598,6 +615,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                 use_cosine_annealing_lr=self.use_cosine_annealing_lr,
                 cosine_annealing_lr_args=self.cosine_annealing_lr_args,
                 track_loss_per_series=self.track_loss_per_series,
+                mistral=self.mistral,
             )
 
     def _create_instance_splitter(self, module: LagLlamaLightningModule, mode: str):
@@ -640,7 +658,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                 batch_size=self.batch_size,
                 shuffle_buffer_length=shuffle_buffer_length,
                 field_names=TRAINING_INPUT_NAMES
-                + ["past_time_feat", "future_time_feat", "data_id", "item_id"],
+                + ["past_time_feat", "future_time_feat", "data_id", "item_id", "feat_static_real", ],
                 # + ["past_time_feat", "future_time_feat"],
                 # + ["past_time_feat", "future_time_feat"],
                 output_type=torch.tensor,
@@ -766,6 +784,8 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
         custom_callbacks = self.trainer_kwargs.get("callbacks", [])
         callbacks = [checkpoint] + custom_callbacks
         trainer_kwargs = {**self.trainer_kwargs, "callbacks": callbacks, "precision": "bf16-mixed"}
+        trainer_kwargs["accelerator"] = "gpu"
+        trainer_kwargs["devices"] = [1]
         trainer = pl.Trainer(**trainer_kwargs)
         training_network.strict_loading = False
         trainer.fit(
@@ -841,7 +861,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
             batch_size=batch_size,
             output_type=torch.tensor,
             field_names=TRAINING_INPUT_NAMES
-                + ["past_time_feat", "future_time_feat"],
+                + ["past_time_feat", "future_time_feat", "feat_static_real"],
         )
 
 
@@ -850,361 +870,361 @@ class DomainAdaptationTrainer(pl.Trainer):
     def _fit_impl(self, model: pl.LightningModule, train_dataloaders: Any | pl.LightningDataModule | None = None, val_dataloaders: Any | None = None, datamodule: pl.LightningDataModule | None = None, ckpt_path: str | Path | None = None) -> None:
         return super()._fit_impl(model, train_dataloaders, val_dataloaders, datamodule, ckpt_path)
 
-class LagLlamaDomainAdaptiationEstimator(LagLlamaEstimator):
+# class LagLlamaDomainAdaptiationEstimator(LagLlamaEstimator):
     
 
-    @classmethod
-    def derive_auto_fields(cls, train_iter):
-        stats = calculate_dataset_statistics(train_iter)
+#     @classmethod
+#     def derive_auto_fields(cls, train_iter):
+#         stats = calculate_dataset_statistics(train_iter)
 
-        return {
-            "num_feat_dynamic_real": stats.num_feat_dynamic_real,
-            "num_feat_static_cat": len(stats.feat_static_cat),
-            "cardinality": [len(cats) for cats in stats.feat_static_cat],
-        }
+#         return {
+#             "num_feat_dynamic_real": stats.num_feat_dynamic_real,
+#             "num_feat_static_cat": len(stats.feat_static_cat),
+#             "cardinality": [len(cats) for cats in stats.feat_static_cat],
+#         }
 
-    def create_transformation(self) -> Transformation:
-        if self.time_feat:
-            return Chain(
-                [
-                    AddTimeFeatures(
-                        start_field=FieldName.START,
-                        target_field=FieldName.TARGET,
-                        output_field=FieldName.FEAT_TIME,
-                        time_features=time_features_from_frequency_str("5T"),
-                        pred_length=self.prediction_length,
-                    ),
-                    # VstackFeatures(
-                    #     output_field=FieldName.FEAT_TIME,
-                    #     input_fields=[FieldName.FEAT_TIME] + [FieldName.FEAT_DYNAMIC_REAL]
-                    # ),
-                    # FilterTransformation(lambda x: sum(abs(x[FieldName.TARGET])) > 0),
-                    AddObservedValuesIndicator(
-                        target_field=FieldName.TARGET,
-                        output_field=FieldName.OBSERVED_VALUES,
-                        imputation_method=DummyValueImputation(0.0),
-                    ),
+#     def create_transformation(self) -> Transformation:
+#         if self.time_feat:
+#             return Chain(
+#                 [
+#                     AddTimeFeatures(
+#                         start_field=FieldName.START,
+#                         target_field=FieldName.TARGET,
+#                         output_field=FieldName.FEAT_TIME,
+#                         time_features=time_features_from_frequency_str("5T"),
+#                         pred_length=self.prediction_length,
+#                     ),
+#                     # VstackFeatures(
+#                     #     output_field=FieldName.FEAT_TIME,
+#                     #     input_fields=[FieldName.FEAT_TIME] + [FieldName.FEAT_DYNAMIC_REAL]
+#                     # ),
+#                     # FilterTransformation(lambda x: sum(abs(x[FieldName.TARGET])) > 0),
+#                     AddObservedValuesIndicator(
+#                         target_field=FieldName.TARGET,
+#                         output_field=FieldName.OBSERVED_VALUES,
+#                         imputation_method=DummyValueImputation(0.0),
+#                     ),
                     
-                ]
-            )
-        else:
-            return Chain(
-                [
-                    AddObservedValuesIndicator(
-                        target_field=FieldName.TARGET,
-                        output_field=FieldName.OBSERVED_VALUES,
-                        imputation_method=DummyValueImputation(0.0),
-                    ),
-                ]
-            )
+#                 ]
+#             )
+#         else:
+#             return Chain(
+#                 [
+#                     AddObservedValuesIndicator(
+#                         target_field=FieldName.TARGET,
+#                         output_field=FieldName.OBSERVED_VALUES,
+#                         imputation_method=DummyValueImputation(0.0),
+#                     ),
+#                 ]
+#             )
 
-    def create_lightning_module(self, use_kv_cache: bool = False) -> pl.LightningModule:
-        model_kwargs = {
-            "input_size": self.input_size,
-            "context_length": self.context_length,
-            "max_context_length": self.max_context_length,
-            "lags_seq": self.lags_seq,
-            "n_layer": self.n_layer,
-            "n_embd_per_head": self.n_embd_per_head,
-            "n_head": self.n_head,
-            "scaling": self.scaling,
-            "distr_output": self.distr_output,
-            "num_parallel_samples": self.num_parallel_samples,
-            "rope_scaling": self.rope_scaling,
-            "time_feat": self.time_feat,
-            "dropout": self.dropout,
-        }
-        if self.ckpt_path is not None:
-            with lora(r=4, alpha=16, dropout=0.05, enabled=True):
-                module = LagLlamaLightningModule.load_from_checkpoint(
-                    checkpoint_path=self.ckpt_path,
-                    strict=False,
-                    loss=self.loss,
-                    lr=self.lr,
-                    weight_decay=self.weight_decay,
-                    context_length=self.context_length,
-                    prediction_length=self.prediction_length,
-                    model_kwargs=model_kwargs,
-                    # Augmentations
-                    aug_prob=self.aug_prob,
-                    freq_mask_rate=self.freq_mask_rate,
-                    freq_mixing_rate=self.freq_mixing_rate,
-                    jitter_prob=self.jitter_prob,
-                    jitter_sigma=self.jitter_sigma,
-                    scaling_prob=self.scaling_prob,
-                    scaling_sigma=self.scaling_sigma,
-                    rotation_prob=self.rotation_prob,
-                    permutation_prob=self.permutation_prob,
-                    permutation_max_segments=self.permutation_max_segments,
-                    permutation_seg_mode=self.permutation_seg_mode,
-                    magnitude_warp_prob=self.magnitude_warp_prob,
-                    magnitude_warp_sigma=self.magnitude_warp_sigma,
-                    magnitude_warp_knot=self.magnitude_warp_knot,
-                    time_warp_prob=self.time_warp_prob,
-                    time_warp_sigma=self.time_warp_sigma,
-                    time_warp_knot=self.time_warp_knot,
-                    window_slice_prob=self.window_slice_prob,
-                    window_slice_reduce_ratio=self.window_slice_reduce_ratio,
-                    window_warp_prob=self.window_warp_prob,
-                    window_warp_window_ratio=self.window_warp_window_ratio,
-                    window_warp_scales=self.window_warp_scales,
-                    use_kv_cache=use_kv_cache,
-                    data_id_to_name_map=self.data_id_to_name_map,
-                    use_cosine_annealing_lr=self.use_cosine_annealing_lr,
-                    cosine_annealing_lr_args=self.cosine_annealing_lr_args,
-                    track_loss_per_series=self.track_loss_per_series,
-                )
-                module.print_trainable_parameters(module.model)
-                return module
-        else:
-            return LagLlamaDALightningModule(
-                loss=self.loss,
-                lr=self.lr,
-                weight_decay=self.weight_decay,
-                context_length=self.context_length,
-                prediction_length=self.prediction_length,
-                model_kwargs=model_kwargs,
-                # Augmentations
-                aug_prob=self.aug_prob,
-                freq_mask_rate=self.freq_mask_rate,
-                freq_mixing_rate=self.freq_mixing_rate,
-                jitter_prob=self.jitter_prob,
-                jitter_sigma=self.jitter_sigma,
-                scaling_prob=self.scaling_prob,
-                scaling_sigma=self.scaling_sigma,
-                rotation_prob=self.rotation_prob,
-                permutation_prob=self.permutation_prob,
-                permutation_max_segments=self.permutation_max_segments,
-                permutation_seg_mode=self.permutation_seg_mode,
-                magnitude_warp_prob=self.magnitude_warp_prob,
-                magnitude_warp_sigma=self.magnitude_warp_sigma,
-                magnitude_warp_knot=self.magnitude_warp_knot,
-                time_warp_prob=self.time_warp_prob,
-                time_warp_sigma=self.time_warp_sigma,
-                time_warp_knot=self.time_warp_knot,
-                window_slice_prob=self.window_slice_prob,
-                window_slice_reduce_ratio=self.window_slice_reduce_ratio,
-                window_warp_prob=self.window_warp_prob,
-                window_warp_window_ratio=self.window_warp_window_ratio,
-                window_warp_scales=self.window_warp_scales,
-                use_kv_cache=use_kv_cache,
-                data_id_to_name_map=self.data_id_to_name_map,
-                use_cosine_annealing_lr=self.use_cosine_annealing_lr,
-                cosine_annealing_lr_args=self.cosine_annealing_lr_args,
-                track_loss_per_series=self.track_loss_per_series,
-            )
+#     def create_lightning_module(self, use_kv_cache: bool = False) -> pl.LightningModule:
+#         model_kwargs = {
+#             "input_size": self.input_size,
+#             "context_length": self.context_length,
+#             "max_context_length": self.max_context_length,
+#             "lags_seq": self.lags_seq,
+#             "n_layer": self.n_layer,
+#             "n_embd_per_head": self.n_embd_per_head,
+#             "n_head": self.n_head,
+#             "scaling": self.scaling,
+#             "distr_output": self.distr_output,
+#             "num_parallel_samples": self.num_parallel_samples,
+#             "rope_scaling": self.rope_scaling,
+#             "time_feat": self.time_feat,
+#             "dropout": self.dropout,
+#         }
+#         if self.ckpt_path is not None:
+#             with lora(r=4, alpha=16, dropout=0.05, enabled=True):
+#                 module = LagLlamaLightningModule.load_from_checkpoint(
+#                     checkpoint_path=self.ckpt_path,
+#                     strict=False,
+#                     loss=self.loss,
+#                     lr=self.lr,
+#                     weight_decay=self.weight_decay,
+#                     context_length=self.context_length,
+#                     prediction_length=self.prediction_length,
+#                     model_kwargs=model_kwargs,
+#                     # Augmentations
+#                     aug_prob=self.aug_prob,
+#                     freq_mask_rate=self.freq_mask_rate,
+#                     freq_mixing_rate=self.freq_mixing_rate,
+#                     jitter_prob=self.jitter_prob,
+#                     jitter_sigma=self.jitter_sigma,
+#                     scaling_prob=self.scaling_prob,
+#                     scaling_sigma=self.scaling_sigma,
+#                     rotation_prob=self.rotation_prob,
+#                     permutation_prob=self.permutation_prob,
+#                     permutation_max_segments=self.permutation_max_segments,
+#                     permutation_seg_mode=self.permutation_seg_mode,
+#                     magnitude_warp_prob=self.magnitude_warp_prob,
+#                     magnitude_warp_sigma=self.magnitude_warp_sigma,
+#                     magnitude_warp_knot=self.magnitude_warp_knot,
+#                     time_warp_prob=self.time_warp_prob,
+#                     time_warp_sigma=self.time_warp_sigma,
+#                     time_warp_knot=self.time_warp_knot,
+#                     window_slice_prob=self.window_slice_prob,
+#                     window_slice_reduce_ratio=self.window_slice_reduce_ratio,
+#                     window_warp_prob=self.window_warp_prob,
+#                     window_warp_window_ratio=self.window_warp_window_ratio,
+#                     window_warp_scales=self.window_warp_scales,
+#                     use_kv_cache=use_kv_cache,
+#                     data_id_to_name_map=self.data_id_to_name_map,
+#                     use_cosine_annealing_lr=self.use_cosine_annealing_lr,
+#                     cosine_annealing_lr_args=self.cosine_annealing_lr_args,
+#                     track_loss_per_series=self.track_loss_per_series,
+#                 )
+#                 module.print_trainable_parameters(module.model)
+#                 return module
+#         else:
+#             return LagLlamaDALightningModule(
+#                 loss=self.loss,
+#                 lr=self.lr,
+#                 weight_decay=self.weight_decay,
+#                 context_length=self.context_length,
+#                 prediction_length=self.prediction_length,
+#                 model_kwargs=model_kwargs,
+#                 # Augmentations
+#                 aug_prob=self.aug_prob,
+#                 freq_mask_rate=self.freq_mask_rate,
+#                 freq_mixing_rate=self.freq_mixing_rate,
+#                 jitter_prob=self.jitter_prob,
+#                 jitter_sigma=self.jitter_sigma,
+#                 scaling_prob=self.scaling_prob,
+#                 scaling_sigma=self.scaling_sigma,
+#                 rotation_prob=self.rotation_prob,
+#                 permutation_prob=self.permutation_prob,
+#                 permutation_max_segments=self.permutation_max_segments,
+#                 permutation_seg_mode=self.permutation_seg_mode,
+#                 magnitude_warp_prob=self.magnitude_warp_prob,
+#                 magnitude_warp_sigma=self.magnitude_warp_sigma,
+#                 magnitude_warp_knot=self.magnitude_warp_knot,
+#                 time_warp_prob=self.time_warp_prob,
+#                 time_warp_sigma=self.time_warp_sigma,
+#                 time_warp_knot=self.time_warp_knot,
+#                 window_slice_prob=self.window_slice_prob,
+#                 window_slice_reduce_ratio=self.window_slice_reduce_ratio,
+#                 window_warp_prob=self.window_warp_prob,
+#                 window_warp_window_ratio=self.window_warp_window_ratio,
+#                 window_warp_scales=self.window_warp_scales,
+#                 use_kv_cache=use_kv_cache,
+#                 data_id_to_name_map=self.data_id_to_name_map,
+#                 use_cosine_annealing_lr=self.use_cosine_annealing_lr,
+#                 cosine_annealing_lr_args=self.cosine_annealing_lr_args,
+#                 track_loss_per_series=self.track_loss_per_series,
+#             )
 
-    def _create_instance_splitter(self, module: LagLlamaLightningModule, mode: str):
-        assert mode in ["training", "validation", "test"]
+#     def _create_instance_splitter(self, module: LagLlamaLightningModule, mode: str):
+#         assert mode in ["training", "validation", "test"]
 
-        instance_sampler = {
-            "training": self.train_sampler,
-            "validation": self.validation_sampler,
-            "test": TestSplitSampler(),
-        }[mode]
+#         instance_sampler = {
+#             "training": self.train_sampler,
+#             "validation": self.validation_sampler,
+#             "test": TestSplitSampler(),
+#         }[mode]
 
-        return InstanceSplitter(
-            target_field=FieldName.TARGET,
-            is_pad_field=FieldName.IS_PAD,
-            start_field=FieldName.START,
-            forecast_start_field=FieldName.FORECAST_START,
-            instance_sampler=instance_sampler,
-            past_length=self.context_length + max(self.lags_seq),
-            future_length=self.prediction_length,
-            time_series_fields=[FieldName.FEAT_TIME, FieldName.OBSERVED_VALUES]
-            if self.time_feat
-            else [FieldName.OBSERVED_VALUES],
-            dummy_value=self.distr_output.value_in_support,
-        )
+#         return InstanceSplitter(
+#             target_field=FieldName.TARGET,
+#             is_pad_field=FieldName.IS_PAD,
+#             start_field=FieldName.START,
+#             forecast_start_field=FieldName.FORECAST_START,
+#             instance_sampler=instance_sampler,
+#             past_length=self.context_length + max(self.lags_seq),
+#             future_length=self.prediction_length,
+#             time_series_fields=[FieldName.FEAT_TIME, FieldName.OBSERVED_VALUES]
+#             if self.time_feat
+#             else [FieldName.OBSERVED_VALUES],
+#             dummy_value=self.distr_output.value_in_support,
+#         )
 
-    def create_training_data_loader(
-        self,
-        data: List[Dataset],
-        module: LagLlamaLightningModule,
-        shuffle_buffer_length: Optional[int] = None,
-        **kwargs,
-    ) -> Iterable:
-        data = Cyclic(data).stream()
-        instances = self._create_instance_splitter(module, "training").apply(
-            data, is_train=True
-        )
-        if self.time_feat:
-            return as_stacked_batches(
-                instances,
-                batch_size=self.batch_size,
-                shuffle_buffer_length=shuffle_buffer_length,
-                field_names=TRAINING_INPUT_NAMES
-                + ["past_time_feat", "future_time_feat", "data_id", "item_id"],
-                # + ["past_time_feat", "future_time_feat"],
-                # + ["past_time_feat", "future_time_feat"],
-                output_type=torch.tensor,
-                num_batches_per_epoch=self.num_batches_per_epoch,
-            )
+#     def create_training_data_loader(
+#         self,
+#         data: List[Dataset],
+#         module: LagLlamaLightningModule,
+#         shuffle_buffer_length: Optional[int] = None,
+#         **kwargs,
+#     ) -> Iterable:
+#         data = Cyclic(data).stream()
+#         instances = self._create_instance_splitter(module, "training").apply(
+#             data, is_train=True
+#         )
+#         if self.time_feat:
+#             return as_stacked_batches(
+#                 instances,
+#                 batch_size=self.batch_size,
+#                 shuffle_buffer_length=shuffle_buffer_length,
+#                 field_names=TRAINING_INPUT_NAMES
+#                 + ["past_time_feat", "future_time_feat", "data_id", "item_id"],
+#                 # + ["past_time_feat", "future_time_feat"],
+#                 # + ["past_time_feat", "future_time_feat"],
+#                 output_type=torch.tensor,
+#                 num_batches_per_epoch=self.num_batches_per_epoch,
+#             )
 
-        else:
-            return as_stacked_batches(
-                instances,
-                batch_size=self.batch_size,
-                shuffle_buffer_length=shuffle_buffer_length,
-                # field_names=TRAINING_INPUT_NAMES,
-                field_names=TRAINING_INPUT_NAMES + ["data_id", "item_id"],
-                # field_names=TRAINING_INPUT_NAMES + [],
-                output_type=torch.tensor,
-                num_batches_per_epoch=self.num_batches_per_epoch,
-            )
+#         else:
+#             return as_stacked_batches(
+#                 instances,
+#                 batch_size=self.batch_size,
+#                 shuffle_buffer_length=shuffle_buffer_length,
+#                 # field_names=TRAINING_INPUT_NAMES,
+#                 field_names=TRAINING_INPUT_NAMES + ["data_id", "item_id"],
+#                 # field_names=TRAINING_INPUT_NAMES + [],
+#                 output_type=torch.tensor,
+#                 num_batches_per_epoch=self.num_batches_per_epoch,
+#             )
 
-    def create_validation_data_loader(
-        self,
-        data: Dataset,
-        module: LagLlamaLightningModule,
-        **kwargs,
-    ) -> Iterable:
-        instances = self._create_instance_splitter(module, "validation").apply(
-            data, is_train=True
-        )
-        if self.time_feat:
-            return as_stacked_batches(
-                instances,
-                batch_size=self.batch_size,
-                field_names=TRAINING_INPUT_NAMES
-                + ["past_time_feat", "future_time_feat", "data_id", "item_id"],
-                # + ["past_time_feat", "future_time_feat"],
-                output_type=torch.tensor,
-            )
-        else:
-            return as_stacked_batches(
-                instances,
-                batch_size=self.batch_size,
-                field_names=TRAINING_INPUT_NAMES + ["data_id", "item_id"],
-                # field_names=TRAINING_INPUT_NAMES,
-                output_type=torch.tensor,
-            )
+#     def create_validation_data_loader(
+#         self,
+#         data: Dataset,
+#         module: LagLlamaLightningModule,
+#         **kwargs,
+#     ) -> Iterable:
+#         instances = self._create_instance_splitter(module, "validation").apply(
+#             data, is_train=True
+#         )
+#         if self.time_feat:
+#             return as_stacked_batches(
+#                 instances,
+#                 batch_size=self.batch_size,
+#                 field_names=TRAINING_INPUT_NAMES
+#                 + ["past_time_feat", "future_time_feat", "data_id", "item_id"],
+#                 # + ["past_time_feat", "future_time_feat"],
+#                 output_type=torch.tensor,
+#             )
+#         else:
+#             return as_stacked_batches(
+#                 instances,
+#                 batch_size=self.batch_size,
+#                 field_names=TRAINING_INPUT_NAMES + ["data_id", "item_id"],
+#                 # field_names=TRAINING_INPUT_NAMES,
+#                 output_type=torch.tensor,
+#             )
     
-    def create_trainer_dl(self, dataset, module):
-        # instances = self._create_instance_splitter(module, "training").apply(
-        #     dataset, is_train=True
-        # )
-        if self.time_feat:
-            # return as_stacked_batches(
-            #     instances,
-            #     batch_size=self.batch_size,
-            #     field_names=TRAINING_INPUT_NAMES
-            #     + ["past_time_feat", "future_time_feat", "data_id", "item_id"],
-            #     # + ["past_time_feat", "future_time_feat"],
-            #     output_type=torch.tensor,
-            # )
-            data_loader = TrainDataLoader(
-    # We cache the dataset, to make training faster
-                Cached(dataset),
-                batch_size=self.batch_size,
-                stack_fn=batchify,
-                transform=self.create_transformation(),
-                # num_batches_per_epoch=100,
-            )
-            return data_loader
+#     def create_trainer_dl(self, dataset, module):
+#         # instances = self._create_instance_splitter(module, "training").apply(
+#         #     dataset, is_train=True
+#         # )
+#         if self.time_feat:
+#             # return as_stacked_batches(
+#             #     instances,
+#             #     batch_size=self.batch_size,
+#             #     field_names=TRAINING_INPUT_NAMES
+#             #     + ["past_time_feat", "future_time_feat", "data_id", "item_id"],
+#             #     # + ["past_time_feat", "future_time_feat"],
+#             #     output_type=torch.tensor,
+#             # )
+#             data_loader = TrainDataLoader(
+#     # We cache the dataset, to make training faster
+#                 Cached(dataset),
+#                 batch_size=self.batch_size,
+#                 stack_fn=batchify,
+#                 transform=self.create_transformation(),
+#                 # num_batches_per_epoch=100,
+#             )
+#             return data_loader
 
-    def train_model(
-        self,
-        training_data: List[Dataset],
-        validation_data: Optional[Dataset] = None,
-        from_predictor: Optional[PyTorchPredictor] = None,
-        shuffle_buffer_length: Optional[int] = None,
-        cache_data: bool = False,
-        ckpt_path: Optional[str] = None,
-        **kwargs,
-    ) -> TrainOutput:
-        transformation = self.create_transformation()
+#     def train_model(
+#         self,
+#         training_data: List[Dataset],
+#         validation_data: Optional[Dataset] = None,
+#         from_predictor: Optional[PyTorchPredictor] = None,
+#         shuffle_buffer_length: Optional[int] = None,
+#         cache_data: bool = False,
+#         ckpt_path: Optional[str] = None,
+#         **kwargs,
+#     ) -> TrainOutput:
+#         transformation = self.create_transformation()
 
-        with env._let(max_idle_transforms=max(len(training_data), 100)):
-            transformed_training_data = transformation.apply(
-                training_data, is_train=True
-            )
-            if cache_data:
-                transformed_training_data = Cached(transformed_training_data)
+#         with env._let(max_idle_transforms=max(len(training_data), 100)):
+#             transformed_training_data = transformation.apply(
+#                 training_data, is_train=True
+#             )
+#             if cache_data:
+#                 transformed_training_data = Cached(transformed_training_data)
 
-            training_network = self.create_lightning_module()
+#             training_network = self.create_lightning_module()
 
-            training_data_loader = self.create_training_data_loader(
-                transformed_training_data,
-                training_network,
-                shuffle_buffer_length=shuffle_buffer_length,
-            )
+#             training_data_loader = self.create_training_data_loader(
+#                 transformed_training_data,
+#                 training_network,
+#                 shuffle_buffer_length=shuffle_buffer_length,
+#             )
 
-        validation_data_loader = None
+#         validation_data_loader = None
 
-        if validation_data is not None:
-            with env._let(max_idle_transforms=max(len(validation_data), 100)):
-                transformed_validation_data = transformation.apply(
-                    validation_data, is_train=True
-                )
-                if cache_data:
-                    transformed_validation_data = Cached(
-                        transformed_validation_data
-                    )
+#         if validation_data is not None:
+#             with env._let(max_idle_transforms=max(len(validation_data), 100)):
+#                 transformed_validation_data = transformation.apply(
+#                     validation_data, is_train=True
+#                 )
+#                 if cache_data:
+#                     transformed_validation_data = Cached(
+#                         transformed_validation_data
+#                     )
 
-                validation_data_loader = self.create_validation_data_loader(
-                    transformed_validation_data,
-                    training_network,
-                )
+#                 validation_data_loader = self.create_validation_data_loader(
+#                     transformed_validation_data,
+#                     training_network,
+#                 )
 
-        if from_predictor is not None:
-            training_network.load_state_dict(
-                from_predictor.network.state_dict()
-            )
+#         if from_predictor is not None:
+#             training_network.load_state_dict(
+#                 from_predictor.network.state_dict()
+#             )
 
-        monitor = "train_loss" if validation_data is None else "val_loss"
-        checkpoint = pl.callbacks.ModelCheckpoint(
-            monitor=monitor, mode="min", verbose=True
-        )
+#         monitor = "train_loss" if validation_data is None else "val_loss"
+#         checkpoint = pl.callbacks.ModelCheckpoint(
+#             monitor=monitor, mode="min", verbose=True
+#         )
 
-        custom_callbacks = self.trainer_kwargs.get("callbacks", [])
-        callbacks = [checkpoint] + custom_callbacks
-        trainer_kwargs = {**self.trainer_kwargs, "callbacks": callbacks}
-        trainer = DomainAdaptationTrainer(**trainer_kwargs)
-        training_network.strict_loading = False
-        trainer.fit(
-            model=training_network,
-            train_dataloaders=training_data_loader,
-            val_dataloaders=validation_data_loader,
-            ckpt_path=ckpt_path,
-        )
+#         custom_callbacks = self.trainer_kwargs.get("callbacks", [])
+#         callbacks = [checkpoint] + custom_callbacks
+#         trainer_kwargs = {**self.trainer_kwargs, "callbacks": callbacks}
+#         trainer = DomainAdaptationTrainer(**trainer_kwargs)
+#         training_network.strict_loading = False
+#         trainer.fit(
+#             model=training_network,
+#             train_dataloaders=training_data_loader,
+#             val_dataloaders=validation_data_loader,
+#             ckpt_path=ckpt_path,
+#         )
 
-        # logger.info(f"Loading best model from {checkpoint.best_model_path}")
-        best_model = training_network.__class__.load_from_checkpoint(
-            checkpoint.best_model_path,
-            strict=False,
-        )
+#         # logger.info(f"Loading best model from {checkpoint.best_model_path}")
+#         best_model = training_network.__class__.load_from_checkpoint(
+#             checkpoint.best_model_path,
+#             strict=False,
+#         )
 
-        return TrainOutput(
-            transformation=transformation,
-            trained_net=best_model,
-            trainer=trainer,
-            predictor=self.create_predictor(transformation, best_model),
-        )
+#         return TrainOutput(
+#             transformation=transformation,
+#             trained_net=best_model,
+#             trainer=trainer,
+#             predictor=self.create_predictor(transformation, best_model),
+#         )
 
 
-    def create_predictor(
-        self,
-        transformation: Transformation,
-        module,
-    ) -> PyTorchPredictor:
-        prediction_splitter = self._create_instance_splitter(module, "test")
-        if self.time_feat:
-            return PyTorchPredictor(
-                input_transform=transformation + prediction_splitter,
-                input_names=PREDICTION_INPUT_NAMES
-                + ["past_time_feat", "future_time_feat"],
-                prediction_net=module,
-                batch_size=self.batch_size,
-                prediction_length=self.prediction_length,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-            )
-        else:
-            return PyTorchPredictor(
-                input_transform=transformation + prediction_splitter,
-                input_names=PREDICTION_INPUT_NAMES,
-                prediction_net=module,
-                batch_size=self.batch_size,
-                prediction_length=self.prediction_length,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-            )
+#     def create_predictor(
+#         self,
+#         transformation: Transformation,
+#         module,
+#     ) -> PyTorchPredictor:
+#         prediction_splitter = self._create_instance_splitter(module, "test")
+#         if self.time_feat:
+#             return PyTorchPredictor(
+#                 input_transform=transformation + prediction_splitter,
+#                 input_names=PREDICTION_INPUT_NAMES
+#                 + ["past_time_feat", "future_time_feat"],
+#                 prediction_net=module,
+#                 batch_size=self.batch_size,
+#                 prediction_length=self.prediction_length,
+#                 device="cuda" if torch.cuda.is_available() else "cpu",
+#             )
+#         else:
+#             return PyTorchPredictor(
+#                 input_transform=transformation + prediction_splitter,
+#                 input_names=PREDICTION_INPUT_NAMES,
+#                 prediction_net=module,
+#                 batch_size=self.batch_size,
+#                 prediction_length=self.prediction_length,
+#                 device="cuda" if torch.cuda.is_available() else "cpu",
+#             )

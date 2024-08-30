@@ -21,7 +21,7 @@ from gluonts.torch.util import repeat_along_dim, take_last
 
 from data.augmentations.freq_mask import freq_mask
 from data.augmentations.freq_mix import freq_mix
-from data.augmentations.gluonts_augmentations import (
+from data.augmentations.augmentations import (
     ApplyAugmentations,
     Jitter,
     MagnitudeWarp,
@@ -33,11 +33,12 @@ from data.augmentations.gluonts_augmentations import (
     WindowWarp,
 )
 
+
 from gluon_utils.gluon_ts_distributions.implicit_quantile_network import (
     ImplicitQuantileNetworkOutput,
 )
 
-from lag_llama.model.module import LagLlamaModel, LagLlamaDAModel
+from lag_llama.model.module import LagLlamaModel, LLMMistralModel, LagLlamaDAModel
 from peft.tuners import lora
 from dataclasses import dataclass, field
 from functools import reduce
@@ -295,12 +296,13 @@ class LagLlamaLightningModule(pl.LightningModule):
         cosine_annealing_lr_args: dict = {},
         track_loss_per_series: bool = False,
         use_kv_cache: bool = True,
+        mistral=False,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.context_length = self.hparams.context_length
         self.prediction_length = self.hparams.prediction_length
-        model = LagLlamaModel(**self.hparams.model_kwargs)        
+        model = LagLlamaModel(**self.hparams.model_kwargs) if not mistral else LLMMistralModel(**self.hparams.model_kwargs)         
         # lora_model = model
         self.model = model
         self.loss = self.hparams.loss
@@ -472,11 +474,15 @@ class LagLlamaLightningModule(pl.LightningModule):
         ]  # (bsz, model.context_length+max(model.lags_seq))
         if self.time_feat:
             past_time_feat = kwargs["past_time_feat"]
+            lpls = kwargs["feat_static_real"]
             future_time_feat = kwargs["future_time_feat"]
             repeated_past_time_feat = past_time_feat.repeat_interleave(
                 self.model.num_parallel_samples, 0
             )
             repeated_future_time_feat = future_time_feat.repeat_interleave(
+                self.model.num_parallel_samples, 0
+            )
+            lpls = lpls.repeat_interleave(
                 self.model.num_parallel_samples, 0
             )
 
@@ -498,6 +504,7 @@ class LagLlamaLightningModule(pl.LightningModule):
                     past_target=repeated_past_target,
                     past_observed_values=repeated_past_observed_values,
                     use_kv_cache=self.use_kv_cache,
+                    lpls=lpls,
                 )
                 # embs.append(emb.cpu().deqtach())
             else:
@@ -576,6 +583,7 @@ class LagLlamaLightningModule(pl.LightningModule):
             past_time_feat=past_time_feat,
             future_time_feat=future_time_feat,
             future_target=future_target_reshaped,
+            lpls=batch["feat_static_real"],
         )  # distr_args is a tuple with two tensors of shape (bsz, context_length+pred_len-1)
         context_target = take_last(
             past_target, dim=-1, num=self.context_length - 1

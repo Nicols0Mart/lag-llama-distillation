@@ -10,6 +10,7 @@ from torch import nn
 from torch.nn import functional as F
 from gluon_utils.scalers.robust_scaler import RobustScaler
 from gluonts.torch.distributions import DistributionOutput
+from ..gluon.mistral import MistralAttention, MistralMLP, MistralSdpaAttention, MistralRMSNorm, config_mist
 
 from .llama3 import TransformerBlock, FeedForward as FeedForward3, RMSNorm as RMSNorm3
 
@@ -491,13 +492,19 @@ class LagLlamaModel(nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Linear(
-                    config.feature_size, config.n_embd_per_head * config.n_head
+                    #TODO: Check if this is correct
+                    # config.feature_size, config.n_embd_per_head * config.n_head
+                    123, config.n_embd_per_head * config.n_head
                 ),
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
                 ln_f=RMSNorm(config.n_embd_per_head * config.n_head),
             )
         )
         self.y_cache = False  # used at time of inference when kv cached is used
+        self.LaplacianPE1 = nn.Linear(32, 32)
+        self.LaplacianPE2 = nn.Linear(32, 32)
+        self.act = nn.LeakyReLU()
+
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -516,6 +523,7 @@ class LagLlamaModel(nn.Module):
         past_time_feat: Optional[torch.Tensor] = None,
         future_time_feat: Optional[torch.Tensor] = None,
         future_target: Optional[torch.Tensor] = None,
+        lpls: Optional[torch.Tensor] = None,
     ):
         scaled_past_target, loc, scale = self.scaler(
             past_target, past_observed_values
@@ -561,10 +569,17 @@ class LagLlamaModel(nn.Module):
             static_feat, dim=-2, size=lags.shape[-2]
         )  # (bsz, context_length+(pred_len-1), 2)
         # expanded_static_feat: (bsz, context_length+(pred_len-1), len(self.lags_seq) + 2); (bsz, 1); (bsz, 1)
-
+        try:
+            lap_pos_enc = self.LaplacianPE2(self.act(self.LaplacianPE1(lpls.to(torch.bfloat16))))
+        except:
+            lap_pos_enc = self.LaplacianPE2(self.act(self.LaplacianPE1(lpls.to(torch.float))))
+        if lap_pos_enc.shape[0] == lags.shape[0]:
+            lap_pos_enc = unsqueeze_expand(
+                lap_pos_enc, dim=-2, size=lags.shape[-2]
+            )
         if past_time_feat is not None:
             return (
-                torch.cat((lags, expanded_static_feat, time_feat), dim=-1),
+                torch.cat((lags, expanded_static_feat, lap_pos_enc, time_feat), dim=-1),
                 loc,
                 scale,
             )
@@ -579,6 +594,7 @@ class LagLlamaModel(nn.Module):
         future_time_feat: Optional[torch.Tensor] = None,
         future_target: Optional[torch.Tensor] = None,
         use_kv_cache: bool = False,
+        lpls: Optional[torch.Tensor] = None,
     ) -> Iterable[torch.Tensor]:
         # if past_time_feat is not None:
         transformer_input, loc, scale = self.prepare_input(
@@ -587,6 +603,7 @@ class LagLlamaModel(nn.Module):
             future_target=future_target,
             past_time_feat=past_time_feat,
             future_time_feat=future_time_feat,
+            lpls=lpls,
         )  # return: (bsz, context_length+(pred_len-1), len(self.lags_seq) + 2); (bsz, 1); (bsz, 1)
         # To use kv cache for inference and pass recent token to transformer
         if use_kv_cache and self.y_cache:
@@ -619,6 +636,46 @@ class LagLlamaModel(nn.Module):
         for block in self.transformer.h:
             block.y_cache = None
             block.attn.kv_cache = None
+
+
+
+class LLMMistralModel(LagLlamaModel):
+    def __init__(
+        self,
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.transformer = nn.ModuleDict(
+            dict(
+                wte=MistralMLP(
+                    #TODO: Check if this is correct
+                    # config.feature_size, config.n_embd_per_head * config.n_head
+                    123, self.config.n_embd_per_head * self.config.n_head
+                ),
+                h=nn.ModuleList([MistralSdpaAttention(config_mist) for _ in range(self.config.n_layer)]),
+                ln_f=MistralRMSNorm(self.config.n_embd_per_head * self.config.n_head),
+            )
+        )
+
+
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(
+                module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer)
+            )
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(
+                module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer)
+            )
+
+    def reset_cache(self) -> None:
+        """
+        Resets all cached key-values in attention.
+        Has to be called after prediction loop in predictor
+        """
+        pass
+
 
 
 class LagLlamaSeqToSeq(LagLlamaModel):

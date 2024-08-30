@@ -35,6 +35,11 @@ Coming Soon:
 
 ⭐ Scripts to <b>reproduce</b> all results in the paper.
 
+___
+
+**Checkpoints**
+
+[Checkpoint for the pretrained model on Pems3|4|7|8](https://vub-my.sharepoint.com/:u:/g/personal/seyed_mohamad_moghadas_vub_be/EfLQt7CIvyRDutx_5kT7DA4BWYaLoPhq-IReYrxS2dRGuA?e=oVueZH)
 
 ____
 
