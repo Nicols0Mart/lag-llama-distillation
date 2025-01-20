@@ -14,6 +14,7 @@ from ..gluon.mistral import MistralAttention, MistralMLP, MistralSdpaAttention, 
 
 from .llama3 import TransformerBlock, FeedForward as FeedForward3, RMSNorm as RMSNorm3
 
+INTERMEDIATE_REPR = 127
 
 @dataclass
 class LTSMConfig:
@@ -327,11 +328,15 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, use_kv_cache: bool) -> torch.Tensor:
         # batch size, sequence length, embedding dimensionality (n_embd)
-        (B, T, C) = x.size()
+        B, T, C = None, None, None
+        if x.ndim==3:
+            B, T, C = x.size()
+        else:
+            B, T, N, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q = self.q_proj(x)
-        k, v = self.kv_proj(x).split(self.n_embd_per_head * self.n_head, dim=2)
+        k, v = self.kv_proj(x).split(self.n_embd_per_head * self.n_head, dim=2 if x.ndim==3 else 3)
 
         if use_kv_cache:
             # Optimized for single next prediction
@@ -353,7 +358,10 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, -1, self.n_head, self.n_embd_per_head).transpose(
             1, 2
         )  # (B, nh, T, hs)
-
+        if x.ndim==4:
+            q = q.reshape(B, self.n_head * N, T, self.n_embd_per_head)
+            k = k.reshape(B, self.n_head * N, T, self.n_embd_per_head)
+            v = v.reshape(B, self.n_head * N, T, self.n_embd_per_head)
         if self.rotary_emb is not None:
             cos, sin = self.rotary_emb(device=v.device, dtype=v.dtype, seq_len=T)
             q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids=None)
@@ -377,7 +385,10 @@ class CausalSelfAttention(nn.Module):
             )
 
         # re-assemble all head outputs side by side
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        if x.ndim==4:
+            y = y.transpose(1, 2).contiguous().view(B, T, N, C)
+        else:
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # output projection
         y = self.c_proj(y)
@@ -494,7 +505,8 @@ class LagLlamaModel(nn.Module):
                 wte=nn.Linear(
                     #TODO: Check if this is correct
                     # config.feature_size, config.n_embd_per_head * config.n_head
-                    123, config.n_embd_per_head * config.n_head
+                    # 123, config.n_embd_per_head * config.n_head
+                    INTERMEDIATE_REPR, config.n_embd_per_head * config.n_head
                 ),
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
                 ln_f=RMSNorm(config.n_embd_per_head * config.n_head),
@@ -531,16 +543,23 @@ class LagLlamaModel(nn.Module):
 
         # In the below code, instead of max(self.lags_seq), it was previously -self.context_length
         if future_target is not None:
-            input = torch.cat(
-                (
-                    scaled_past_target[..., max(self.lags_seq) :],  # Just the context
-                    (future_target[..., :-1] - loc)
-                    / scale,  # Not sure about the -1 here. Maybe so since the last value isn't used in the model for prediction of any new values. also if the prediction length is 1, this doesn't really affect anything
-                ),
-                dim=-1,
-            )  # Shape is (bsz, context_length+(pred_len-1))
+            if scaled_past_target.ndim==2:
+                input = torch.cat(
+                    (
+                        scaled_past_target[..., max(self.lags_seq) :] ,  # Just the context
+                        (future_target[..., :-1] - loc)
+                        / scale,  # Not sure about the -1 here. Maybe so since the last value isn't used in the model for prediction of any new values. also if the prediction length is 1, this doesn't really affect anything
+                    ),
+                    dim=-1,
+                )  # Shape is (bsz, context_length+(pred_len-1))
+            else:
+                input = torch.cat((
+                    scaled_past_target[..., max(self.lags_seq) :,:],
+                    (future_target[..., :-1, :] - loc) / scale,), dim=-2)
+
+
         else:
-            input = scaled_past_target[..., max(self.lags_seq) :]
+            input = scaled_past_target[..., max(self.lags_seq) :] if scaled_past_target.ndim==2 else scaled_past_target[..., max(self.lags_seq) :,:]
         if (past_time_feat is not None) and (future_time_feat is not None):
             time_feat = (
                 torch.cat(
@@ -553,30 +572,42 @@ class LagLlamaModel(nn.Module):
                 if future_time_feat is not None
                 else past_time_feat[..., max(self.lags_seq) :, :]
             )
-
-        prior_input = (
-            past_target[..., : max(self.lags_seq)] - loc
-        ) / scale  # This the history used to construct lags.  # bsz, max(self.lags_seq)
-
+        if past_target.ndim==2:
+            prior_input = (
+                past_target[..., : max(self.lags_seq)] - loc
+            ) / scale  # This the history used to construct lags.  # bsz, max(self.lags_seq)
+        else:
+            prior_input = (
+                past_target[..., : max(self.lags_seq), :] - loc
+            ) / scale  # This the history used to construct lags.  # bsz, max(self.lags_seq)
         lags = lagged_sequence_values(
-            self.lags_seq, prior_input, input, dim=-1
+            self.lags_seq, prior_input, input, dim=-1 if input.ndim==2 else -2
         )  # Lags are added as an extra dim. Shape is (bsz, context_length+(pred_len-1), len(self.lags_seq))
 
         static_feat = torch.cat(
             (loc.abs().log1p(), scale.log()), dim=-1
         )  # (bsz, 2) (loc and scale are concatenated)
         expanded_static_feat = unsqueeze_expand(
-            static_feat, dim=-2, size=lags.shape[-2]
+            static_feat, dim=-2 if lags.ndim==3 else -3, size=lags.shape[-2] if lags.ndim==3 else lags.shape[-3]
         )  # (bsz, context_length+(pred_len-1), 2)
         # expanded_static_feat: (bsz, context_length+(pred_len-1), len(self.lags_seq) + 2); (bsz, 1); (bsz, 1)
         try:
             lap_pos_enc = self.LaplacianPE2(self.act(self.LaplacianPE1(lpls.to(torch.bfloat16))))
         except:
             lap_pos_enc = self.LaplacianPE2(self.act(self.LaplacianPE1(lpls.to(torch.float))))
-        if lap_pos_enc.shape[0] == lags.shape[0]:
-            lap_pos_enc = unsqueeze_expand(
-                lap_pos_enc, dim=-2, size=lags.shape[-2]
-            )
+        if lap_pos_enc.ndim==2:
+            if lap_pos_enc.shape[0] == lags.shape[0]:
+                lap_pos_enc = unsqueeze_expand(
+                    lap_pos_enc, dim=-2, size=lags.shape[-2]
+                )
+                lap_pos_enc = unsqueeze_expand(lap_pos_enc, dim=1, size=lags.shape[1])
+                time_feat = time_feat.unsqueeze(2).repeat(1, 1, lags.shape[2], 1)
+        else:
+            lap_pos_enc = lap_pos_enc.unsqueeze(1).repeat(1, lags.shape[1], 1, 1)
+            time_feat = time_feat.unsqueeze(2).repeat(1, 1, lags.shape[2], 1)
+        if lags.ndim==4:
+            # expanded_static_feat = expanded_static_feat.reshape(expanded_static_feat.shape[0], expanded_static_feat.shape[1], expanded_static_feat.shape[3]//4, 4).repeat(1, 1, 2, 1)
+            expanded_static_feat = expanded_static_feat.repeat(1, 1, 3, 1)
         if past_time_feat is not None:
             return (
                 torch.cat((lags, expanded_static_feat, lap_pos_enc, time_feat), dim=-1),
@@ -651,7 +682,7 @@ class LLMMistralModel(LagLlamaModel):
                 wte=MistralMLP(
                     #TODO: Check if this is correct
                     # config.feature_size, config.n_embd_per_head * config.n_head
-                    123, self.config.n_embd_per_head * self.config.n_head
+                    INTERMEDIATE_REPR, self.config.n_embd_per_head * self.config.n_head
                 ),
                 h=nn.ModuleList([MistralSdpaAttention(config_mist) for _ in range(self.config.n_layer)]),
                 ln_f=MistralRMSNorm(self.config.n_embd_per_head * self.config.n_head),
