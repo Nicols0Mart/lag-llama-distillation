@@ -59,8 +59,9 @@ from pandas.tseries.frequencies import to_offset
 os.environ["PYDEVD_DISABLE_FILE_VALIDATION"] = "1"
 
 # %%
-train_dataset_names = ["PEMS03", "PEMS04", "PEMS07", "PEMS08"]
-test_datasets = ["PEMS07M"]
+# train_dataset_names = ["PEMS03", "PEMS07", "PEMS08"]
+train_dataset_names = ["PEMS04"]
+test_datasets = ["PEMS04"]
 data_id_to_name_map = {}
 name_to_data_id_map  = {}
 dataset_paths = {
@@ -836,7 +837,7 @@ train_data = CombinedDataset(all_datasets, weights=None)
 val_data = CombinedDataset(val_datasets, weights=None)
 
 # %%
-fine_tune_datasets = ["PEMS07M"]
+fine_tune_datasets = test_datasets
 fine_all_datasets, fine_val_datasets, fine_dataset_num_series = [], [], []
 fine_dataset_train_num_points, fine_dataset_val_num_points = [], []
 for data_id, name in enumerate(fine_tune_datasets):
@@ -885,13 +886,13 @@ fine_train_data = CombinedDataset(fine_all_datasets, weights=None)
 fine_val_data = CombinedDataset(fine_val_datasets+[], weights=None)
 
 # %%
-test_dataset = test_dataset_factory_pems(loaded_df=pems_loader(dataset_paths["PEMS07M"]), date=starts["PEMS07M"], data_id=-1, name="PEMS07M")
+test_dataset = test_dataset_factory_pems(loaded_df=pems_loader(dataset_paths[test_datasets[0]]), date=starts[test_datasets[0]], data_id=-1, name=test_datasets[0])
 
 # %%
 test_dataset[0]
 
 # %%
-assert len(test_dataset) == 228
+# assert len(test_dataset) == 228
 
 
 # %% [markdown]
@@ -951,20 +952,21 @@ def calc_metrics(ground_truth, prediction, horizon=5):
         reals = torch.cat([reals, torch.from_numpy(real.values)], dim=1)
     return MAE_torch(preds.T[horizon, ...], reals[horizon, ...], 0.0)[0], RMSE_torch(preds.T[horizon, ...], reals[horizon, ...], 0.0), metrics.masked_mape(reals[horizon, ...], preds.T[horizon, ...])
 # %%
-# train_output = estimator.train_model(train_data, shuffle_buffer_length=None, ckpt_path=None, use_lora=False)
+train_output = estimator.train_model(train_data, shuffle_buffer_length=None, ckpt_path=None, use_lora=False)
 
-# predictor = train_output.predictor
+predictor = train_output.predictor
 # lightning_module = train_output.trained_net
 # BASED_CHECKPOINT_CL_96 = train_output.trainer.checkpoint_callback.best_model_path
 # BASED_CHECKPOINT_CL_96 = "/home/seyed/PycharmProjects/step/lag-llama/lightning_logs/version_449/checkpoints/epoch=481-step=168700.ckpt"
-BASED_CHECKPOINT_CL_96 = "/home/seyed/PycharmProjects/step/lag-llama/lightning_logs/version_450/checkpoints/epoch=633-step=221900.ckpt"
+# BASED_CHECKPOINT_CL_96 = "/home/seyed/PycharmProjects/step/lag-llama/lightning_logs/version_450/checkpoints/epoch=633-step=221900.ckpt"
+# BASED_CHECKPOINT_CL_96 = "/home/seyed/PycharmProjects/step/lag-llama/lightning_logs/version_516/checkpoints/epoch=387-step=135800.ckpt"
 
 # %%
 mae_cl_96, rmse_cl_96, mape_cl_96 = [[], [], []], [[], [], []], [[], [], []]
-estimator.trainer_kwargs["max_epochs"] = 670
+estimator.trainer_kwargs["max_epochs"] = 390
 # best_model_path = BEST_FINE_TUNE
-estimator.ckpt_path = BASED_CHECKPOINT_CL_96
-predictor = estimator.train(fine_train_data, shuffle_buffer_length=None, ckpt_path=BASED_CHECKPOINT_CL_96, use_lora=False)
+# estimator.ckpt_path = BASED_CHECKPOINT_CL_96
+# predictor = estimator.train(fine_train_data, shuffle_buffer_length=None, ckpt_path=BASED_CHECKPOINT_CL_96, use_lora=False)
 # Make evaluations
 forecast_it, ts_it = make_evaluation_predictions(
 dataset=test_dataset, predictor=predictor, num_samples=100

@@ -8,14 +8,6 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from transformers.utils import (
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    is_flash_attn_2_available,
-    is_flash_attn_greater_or_equal_2_10,
-    logging,
-    replace_return_docstrings,
-)
 # from transformers.modeling_flashtext import _flash_attention_forward
 
 class MistralRMSNorm(nn.Module):
@@ -287,7 +279,7 @@ class MistralAttention(nn.Module):
         self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.o_proj = nn.Linear(config.hidden_size*3, config.hidden_size*3, bias=False)
 
         self.rotary_emb = MistralRotaryEmbedding(
             self.head_dim,
@@ -517,14 +509,14 @@ class MistralSdpaAttention(MistralAttention):
             )
         hidden_states_clone = hidden_states.clone()
         hidden_states = self.rms_1(hidden_states)
-        bsz, q_len, _ = hidden_states.size()
+        bsz, q_len, k_nn, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len*k_nn, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len*k_nn, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len*k_nn, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -565,7 +557,7 @@ class MistralSdpaAttention(MistralAttention):
         attn_output = attn_output.view(bsz, q_len, -1)
 
         attn_output = self.o_proj(attn_output)
-        hidden_states = hidden_states_clone + attn_output
+        hidden_states = hidden_states_clone + attn_output.reshape(*attn_output.size()[:2],k_nn, attn_output.size()[2]//k_nn)
         y = hidden_states + self.mlp(self.rms_2(hidden_states))
         return y
 

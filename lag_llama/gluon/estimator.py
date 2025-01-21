@@ -1,6 +1,6 @@
 from collections import namedtuple
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from gluonts.dataset.loader import TrainDataLoader
 from gluonts.itertools import Cached
 from gluonts.torch.batchify import batchify
@@ -43,7 +43,31 @@ from gluonts.torch.distributions import StudentTOutput, NormalOutput
 from gluon_utils.gluon_ts_distributions.implicit_quantile_network import (
     ImplicitQuantileNetworkOutput, GumbelDistributionOutput
 )
+from gluonts.time_feature import TimeFeature
+from gluonts.dataset.field_names import FieldName
+from gluonts.transform import (
+    AddObservedValuesIndicator,
+    AddTimeFeatures,
+    Chain,
+    ExpectedNumInstanceSampler,
+    TestSplitSampler,
+    Transformation,
+    ValidationSplitSampler,
+)
+from torch.nn import functional as F
+from gluonts.core.component import validated
+from gluonts.dataset.common import DataEntry
+from gluonts.transform.sampler import InstanceSampler
+from typing import Optional, Type
+from gluonts.transform._base import FlatMapTransformation
 
+from torch.distributions import (
+    AffineTransform,
+    Distribution,
+    TransformedDistribution,
+    StudentT,
+)
+from gluonts.torch.distributions import DistributionOutput
 from lag_llama.gluon.lightning_module import LagLlamaLightningModule, LagLlamaDALightningModule
 from gluonts.core.component import validated
 from gluonts.dataset.common import Dataset
@@ -105,23 +129,6 @@ class ValidSplitSampler(InstanceSampler):
             return np.array(list(range(b+offset, b+1))) if a <= b else np.array([], dtype=int)
 
 
-from gluonts.time_feature import TimeFeature
-from gluonts.dataset.field_names import FieldName
-from gluonts.transform import (
-    AddObservedValuesIndicator,
-    AddTimeFeatures,
-    Chain,
-    ExpectedNumInstanceSampler,
-    TestSplitSampler,
-    Transformation,
-    ValidationSplitSampler,
-)
-
-from gluonts.core.component import validated
-from gluonts.dataset.common import DataEntry
-from gluonts.transform.sampler import InstanceSampler
-from typing import Optional, Type
-from gluonts.transform._base import FlatMapTransformation
 
 
 class CustomInstanceSplitter(FlatMapTransformation):
@@ -220,6 +227,66 @@ class CustomInstanceSplitter(FlatMapTransformation):
             d[self.forecast_start_field] = d[self.start_field] + i + lt
             yield d
 
+
+
+
+class AffineTransformed(TransformedDistribution):
+    def __init__(self, base_distribution: Distribution, loc=None, scale=None, event_dim=0):
+        self.scale = 1.0 if scale is None else scale
+        self.loc = 0.0 if loc is None else loc
+
+        super().__init__(base_distribution, [AffineTransform(loc=self.loc, scale=self.scale, event_dim=event_dim)])
+
+    @property
+    def mean(self):
+        """
+        Returns the mean of the distribution.
+        """
+        return self.base_dist.mean * self.scale + self.loc
+
+    @property
+    def variance(self):
+        """
+        Returns the variance of the distribution.
+        """
+        return self.base_dist.variance * self.scale**2
+
+    @property
+    def stddev(self):
+        """
+        Returns the standard deviation of the distribution.
+        """
+        return self.variance.sqrt()
+
+
+class MutivariateStudentTOutput(DistributionOutput):
+    args_dim: Dict[str, int] = {"df": 1, "loc": 1, "scale": 1}
+    distr_cls: type = StudentT
+
+    @classmethod
+    def domain_map(
+        cls, df: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor
+    ):
+        epsilon = torch.finfo(scale.dtype).eps
+        scale = F.softplus(scale).clamp_min(epsilon)
+        df = 2.0 + F.softplus(df)
+        return df.squeeze(-1), loc.squeeze(-1), scale.squeeze(-1)
+
+    @property
+    def event_shape(self) -> Tuple:
+        return (3,)
+
+    def distribution(
+        self,
+        distr_args,
+        loc: Optional[torch.Tensor] = None,
+        scale: Optional[torch.Tensor] = None,
+    ) -> Distribution:
+        distr = self._base_distribution(distr_args)
+        if loc is None and scale is None:
+            return distr
+        else:
+            return AffineTransformed(distr, loc=loc, scale=scale, event_dim=self.event_dim)
 
 class LagLlamaEstimator(PyTorchLightningEstimator):
     """
@@ -351,7 +418,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
         self.lr = lr
         self.weight_decay = weight_decay
         if distr_output == "studentT":
-            distro_output = StudentTOutput()
+            distro_output = MutivariateStudentTOutput()
         elif distr_output == "iqn":
             distro_output = ImplicitQuantileNetworkOutput()
         elif distr_output == "gumbel":
@@ -454,13 +521,13 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                     AsNumpyArray(
                         field=FieldName.FEAT_STATIC_REAL,
                         expected_ndim=1,
-                        dtype=int,
+                        # dtype=int,
                     ),
-                    # AsNumpyArray(
-                    #     field=FieldName.FEAT_DYNAMIC_REAL,
-                    #     expected_ndim=2,
-                    #     dtype=int,
-                    # ),
+                    AsNumpyArray(
+                        field=FieldName.FEAT_DYNAMIC_REAL,
+                        expected_ndim=2,
+                        # dtype=int,
+                    ),
                 ]
             )
         else:
@@ -739,7 +806,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
     ) -> TrainOutput:
         transformation = self.create_transformation()
 
-        with env._let(max_idle_transforms=max(len(training_data), 100)):
+        with env._let(max_idle_transforms=min(len(training_data), 100)):
             transformed_training_data = transformation.apply(
                 training_data, is_train=True
             )

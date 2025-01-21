@@ -297,6 +297,7 @@ class LagLlamaLightningModule(pl.LightningModule):
         track_loss_per_series: bool = False,
         use_kv_cache: bool = True,
         mistral=False,
+        use_feat_dynamic_real=False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -305,6 +306,7 @@ class LagLlamaLightningModule(pl.LightningModule):
         model = LagLlamaModel(**self.hparams.model_kwargs) if not mistral else LLMMistralModel(**self.hparams.model_kwargs)         
         # lora_model = model
         self.model = model
+        self.use_feat_dynamic_real = use_feat_dynamic_real
         self.loss = self.hparams.loss
         self.lr = self.hparams.lr
         self.weight_decay = self.hparams.weight_decay
@@ -586,14 +588,14 @@ class LagLlamaLightningModule(pl.LightningModule):
             lpls=batch["feat_static_real"],
         )  # distr_args is a tuple with two tensors of shape (bsz, context_length+pred_len-1)
         context_target = take_last(
-            past_target, dim=-1, num=self.context_length - 1
+            past_target, dim=-1 if not self.use_feat_dynamic_real else -2, num=self.context_length - 1
         )  # (bsz, context_length-1) # Basically removes the first value since it cannot be predicted
         target = torch.cat(
             (context_target, future_target_reshaped),
             dim=1,
         )  # (bsz, context_length-1+pred_len) # values that can be predicted
         context_observed = take_last(
-            past_observed_values, dim=-1, num=self.context_length - 1
+            past_observed_values, dim=-1 if not self.use_feat_dynamic_real else -2, num=self.context_length - 1
         )  # same as context_target, but for observed_values tensor
         observed_values = torch.cat(
             (context_observed, future_observed_reshaped), dim=1

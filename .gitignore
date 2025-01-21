@@ -180,3 +180,6 @@ wandb/
 runs/
 tmp_exp/
 .vscode/launch.json
+traffic_flow.gif
+cache/2fe5cba94a7363003a7ebcae76d610d87026c783.json
+cache/46c4d7d529d0c1c7c3ab84951c10760b5aa607c6.json

@@ -660,7 +660,8 @@ def dataset_factory_pems(
         return ListDataset(data, freq=freq)
     train_data_lds_04 = to_deepar_format(train_data_04, feat_time_04, dataset_name=name, fold_size=fold_size)
     test_data_lds_04 = to_deepar_format(loaded_df, aggregated_04, dataset_name=name,)
-    meta_data = MetaData(freq="5T", prediction_length=future_seq_len)
+    meta_freq = "5T" if name != "crowd" else "30T"
+    meta_data = MetaData(freq=meta_freq, prediction_length=future_seq_len)
     raw_train_dataset = TrainDatasets(train=train_data_lds_04, test=test_data_lds_04, metadata=meta_data)
     max_train_end_date = None
     timestep_delta = pd.tseries.frequencies.to_offset(freq)
@@ -978,6 +979,7 @@ for data_id, name in enumerate(fine_tune_datasets):
         data_id=data_id, 
         fold_size=None,
         name=name,
+        freq="30min" if name == "crowd" else "5min",
     )
      print(
      "Dataset:",
@@ -1024,7 +1026,7 @@ estimator = LagLlamaEstimator(
     input_size=estimator_args["input_size"],
     n_layer=estimator_args["n_layer"]*4,
     n_embd_per_head=estimator_args["n_embd_per_head"],
-    n_head=estimator_args["n_head"]*2,
+    n_head=estimator_args["n_head"],
     scaling=estimator_args["scaling"],
     time_feat=estimator_args["time_feat"],
     num_batches_per_epoch=350,
@@ -1078,7 +1080,7 @@ estimator.ckpt_path = BEST_PRETRAINING_MODEL_PATH
 # logger.info("Best Pretrained model located in %s", BASED_CHECKPOINT_CL_96)
 # %%
 mae_cl_96, rmse_cl_96, mape_cl_96 = [[], [], []], [[], [], []], [[], [], []]
-estimator.trainer_kwargs["max_epochs"] = 670
+estimator.trainer_kwargs["max_epochs"] = 1500
 # best_model_path = BEST_FINE_TUNE
 # estimator.ckpt_path = BASED_CHECKPOINT_CL_96
 predictor = estimator.train(fine_train_data, shuffle_buffer_length=None, ckpt_path=BEST_PRETRAINING_MODEL_PATH, use_lora=False)

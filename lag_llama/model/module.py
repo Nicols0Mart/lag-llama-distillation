@@ -15,7 +15,7 @@ from ..gluon.mistral import MistralAttention, MistralMLP, MistralSdpaAttention, 
 from .llama3 import TransformerBlock, FeedForward as FeedForward3, RMSNorm as RMSNorm3
 
 INTERMEDIATE_REPR = 127
-
+KNN = 3
 @dataclass
 class LTSMConfig:
     # feature_size: int = 3 + 6 + 2  # target + loc + scale + time features
