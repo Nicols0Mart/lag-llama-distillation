@@ -10,6 +10,7 @@ import torch
 from gluonts.core.component import validated
 from gluonts.dataset.common import Dataset
 from gluonts.dataset.field_names import FieldName
+from gluonts.torch.modules.lambda_layer import LambdaLayer
 from gluonts.dataset.loader import as_stacked_batches
 from gluonts.dataset.stat import calculate_dataset_statistics
 from gluonts.itertools import Cyclic
@@ -41,7 +42,7 @@ from peft import LoraConfig, get_peft_model
 from gluonts.torch.model.deepar import DeepAREstimator
 from gluonts.torch.distributions import StudentTOutput, NormalOutput
 from gluon_utils.gluon_ts_distributions.implicit_quantile_network import (
-    ImplicitQuantileNetworkOutput, GumbelDistributionOutput
+    ImplicitQuantileNetworkOutput, GumbelDistributionOutput, PtArgProj
 )
 from gluonts.time_feature import TimeFeature
 from gluonts.dataset.field_names import FieldName
@@ -66,6 +67,7 @@ from torch.distributions import (
     Distribution,
     TransformedDistribution,
     StudentT,
+    Independent
 )
 from gluonts.torch.distributions import DistributionOutput
 from lag_llama.gluon.lightning_module import LagLlamaLightningModule, LagLlamaDALightningModule
@@ -257,11 +259,125 @@ class AffineTransformed(TransformedDistribution):
         Returns the standard deviation of the distribution.
         """
         return self.variance.sqrt()
+    
+    
+    def entropy(self):
+        """
+        Computes the entropy of the affine-transformed distribution.
+
+        For an affine transformation Y = scale * X + loc,
+        the entropy H(Y) = H(X) + log|scale|
+
+        For multi-dimensional distributions, if scale is a vector,
+        H(Y) = H(X) + sum(log|scale_i|) over all dimensions i.
+        """
+        # Compute the entropy of the base distribution
+        base_entropy = self.base_dist.entropy()
+
+        # Ensure scale is a tensor for consistency
+        if isinstance(self.scale, (float, int)):
+            scale_tensor = torch.tensor(self.scale)
+        else:
+            scale_tensor = torch.as_tensor(self.scale)
+
+        # Compute log|scale|
+        log_abs_scale = torch.log(torch.abs(scale_tensor))
+
+        # If the distribution is multi-dimensional, sum the log|scale| across event dimensions
+        # Assuming scale is applied per event dimension
+        if log_abs_scale.dim() > 0:
+            entropy_adjustment = log_abs_scale.sum()
+        else:
+            entropy_adjustment = log_abs_scale
+
+        # Total entropy is base entropy plus the adjustment
+        total_entropy = base_entropy + entropy_adjustment
+
+        return total_entropy
 
 
-class MutivariateStudentTOutput(DistributionOutput):
+class HFDistributionOutput:
+    distr_cls: type
+    in_features: int
+    args_dim: Dict[str, int]
+
+    def __init__(self, dim: int = 1) -> None:
+        self.dim = dim
+        self.args_dim = {k: dim * self.args_dim[k] for k in self.args_dim}
+
+    def _base_distribution(self, distr_args):
+        if self.dim == 1:
+            return self.distr_cls(*distr_args)
+        else:
+            return Independent(self.distr_cls(*distr_args), 1)
+
+    def distribution(
+        self,
+        distr_args,
+        loc: Optional[torch.Tensor] = None,
+        scale: Optional[torch.Tensor] = None,
+    ) -> Distribution:
+        distr = self._base_distribution(distr_args)
+        if loc is None and scale is None:
+            return distr
+        else:
+            return AffineTransformed(distr, loc=loc, scale=scale, event_dim=3)
+
+    @property
+    def event_shape(self) -> Tuple:
+        r"""
+        Shape of each individual event contemplated by the distributions that this object constructs.
+        """
+        return () if self.dim == 1 else (self.dim,)
+
+    @property
+    def event_dim(self) -> int:
+        r"""
+        Number of event dimensions, i.e., length of the `event_shape` tuple, of the distributions that this object
+        constructs.
+        """
+        return len(self.event_shape)
+
+    @property
+    def value_in_support(self) -> float:
+        r"""
+        A float that will have a valid numeric value when computing the log-loss of the corresponding distribution. By
+        default 0.0. This value will be used when padding data series.
+        """
+        return 0.0
+
+    def get_args_proj(self, in_features: int) -> nn.Module:
+        r"""
+        Return the parameter projection layer that maps the input to the appropriate parameters of the distribution.
+        """
+        return PtArgProj(
+            in_features=in_features,
+            args_dim={key: 1 for key in self.args_dim.keys()},
+            domain_map=LambdaLayer(self.domain_map),
+        )
+
+    def domain_map(self, *args: torch.Tensor):
+        r"""
+        Converts arguments to the right shape and domain. The domain depends on the type of distribution, while the
+        correct shape is obtained by reshaping the trailing axis in such a way that the returned tensors define a
+        distribution of the right event_shape.
+        """
+        raise NotImplementedError()
+
+    @staticmethod
+    def squareplus(x: torch.Tensor) -> torch.Tensor:
+        r"""
+        Helper to map inputs to the positive orthant by applying the square-plus operation. Reference:
+        https://twitter.com/jon_barron/status/1387167648669048833
+        """
+        return (x + torch.sqrt(torch.square(x) + 4.0)) / 2.0
+
+class MutivariateStudentTOutput(HFDistributionOutput):
     args_dim: Dict[str, int] = {"df": 1, "loc": 1, "scale": 1}
     distr_cls: type = StudentT
+
+    def _base_distribution(self, distr_args):
+        return super()._base_distribution(distr_args)
 
     @classmethod
     def domain_map(
@@ -403,6 +519,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
             lag_indices.extend(
                 get_lags_for_frequency(freq_str=freq, num_default_lags=1)
             )
+        self.use_feat_dynamic_real = use_feat_dynamic_real
 
         if len(lag_indices):
             self.lags_seq = sorted(set(lag_indices))
@@ -418,7 +535,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
         self.lr = lr
         self.weight_decay = weight_decay
         if distr_output == "studentT":
-            distro_output = MutivariateStudentTOutput()
+            distro_output = MutivariateStudentTOutput(dim=3)
         elif distr_output == "iqn":
             distro_output = ImplicitQuantileNetworkOutput()
         elif distr_output == "gumbel":
@@ -485,6 +602,25 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
             ckpt_path=ckpt_path,
             use_lora=use_lora,
         ).predictor
+    
+    def train_with_module(
+        self,
+        training_data: Dataset,
+        validation_data: Optional[Dataset] = None,
+        shuffle_buffer_length: Optional[int] = None,
+        cache_data: bool = False,
+        ckpt_path: Optional[str] = None,
+        **kwargs,
+    ) -> LagLlamaLightningModule:
+        use_lora = kwargs.get("use_lora", True)
+        return self.train_model(
+            training_data,
+            validation_data,
+            shuffle_buffer_length=shuffle_buffer_length,
+            cache_data=cache_data,
+            ckpt_path=ckpt_path,
+            use_lora=use_lora,
+        ).trained_net
 
     @classmethod
     def derive_auto_fields(cls, train_iter):
@@ -568,6 +704,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                     context_length=self.context_length,
                     prediction_length=self.prediction_length,
                     model_kwargs=model_kwargs,
+                    use_feat_dynamic_real=self.use_feat_dynamic_real,
                     # Augmentations
                     aug_prob=self.aug_prob,
                     freq_mask_rate=self.freq_mask_rate,
@@ -610,6 +747,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                     context_length=self.context_length,
                     prediction_length=self.prediction_length,
                     model_kwargs=model_kwargs,
+                    use_feat_dynamic_real=self.use_feat_dynamic_real,
                     # Augmentations
                     aug_prob=self.aug_prob,
                     freq_mask_rate=self.freq_mask_rate,
@@ -659,6 +797,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                 freq_mask_rate=self.freq_mask_rate,
                 freq_mixing_rate=self.freq_mixing_rate,
                 jitter_prob=self.jitter_prob,
+                use_feat_dynamic_real=self.use_feat_dynamic_real,
                 jitter_sigma=self.jitter_sigma,
                 scaling_prob=self.scaling_prob,
                 scaling_sigma=self.scaling_sigma,

@@ -32,7 +32,7 @@ from data.augmentations.augmentations import (
     WindowSlice,
     WindowWarp,
 )
-
+from transformers.modeling_outputs import SampleTSPredictionOutput
 
 from gluon_utils.gluon_ts_distributions.implicit_quantile_network import (
     ImplicitQuantileNetworkOutput,
@@ -627,7 +627,10 @@ class LagLlamaLightningModule(pl.LightningModule):
                     self.loss(distr, target) * observed_values
                 ).sum() / observed_values.sum().clamp_min(1.0)
             else:
-                loss = self.loss(distr, target) * observed_values
+                # loss = self.loss(distr, target) * observed_values
+                loss = self.loss(distr, target)
+                # loss = self.loss(distr, target) + 10.5 * distr.entropy()
+                # loss = distr.entropy()
 
         if not return_observed_values:
             return loss
@@ -813,6 +816,30 @@ class LagLlamaLightningModule(pl.LightningModule):
             return {"optimizer": optimizer, "lr_scheduler": scheduler}
         else:
             return optimizer
+        
+    @torch.no_grad()
+    def generate(
+        self,
+        past_target: torch.Tensor,
+        past_observed_values: torch.Tensor,
+        future_time_feat: torch.Tensor,
+        past_time_feat: Optional[torch.Tensor] = None,
+        future_target_reshaped: Optional[torch.Tensor] = None,
+        past_values: Optional[torch.Tensor] = None,
+        future_time_features: Optional[bool] = None,
+        lplc: Optional[bool] = None,
+    ) -> SampleTSPredictionOutput:
+        concat_future_samples = self.forward(
+            past_target=past_target,
+            past_observed_values=past_observed_values,
+            past_time_feat=past_time_feat,
+            future_time_feat=future_time_feat,
+            future_target=future_target_reshaped,
+            feat_static_real=lplc,
+        )
+        return SampleTSPredictionOutput(
+            sequences=concat_future_samples
+        )
 
 
 class LagLlamaDALightningModule(pl.LightningModule):
