@@ -731,9 +731,11 @@ BEST = None
 BASED_CHECKPOINT_CL_96 = "/home/seyed/PycharmProjects/step/lag-llama/lightning_logs/version_675/checkpoints/epoch=4-step=1750.ckpt"
 # BASED_CHECKPOINT_CL_96 = "/home/seyed/PycharmProjects/step/lag-llama/lightning_logs/version_504/checkpoints/epoch=481-step=168700.ckpt"
 # BASED_CHECKPOINT_CL_96 = "/home/seyed/PycharmProjects/step/lag-llama/lightning_logs/version_515/checkpoints/epoch=1424-step=498750.ckpt"
+
+
 estimator = LagLlamaEstimator(
     ckpt_path=None,
-    prediction_length=12,
+    prediction_length=30,
     context_length=48 * 2,
     # estimator args
     input_size=estimator_args["input_size"],
