@@ -84,6 +84,7 @@ dataset_paths = {
     "PEMS07": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS07/PEMS07.npz",
     "PEMS08": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS08/PEMS08.npz",
     "PEMS07M": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS07M/PEMS07M.npz",
+    "crowd": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS07M/PEMS07M.npz",
 }
 starts = {
     "PEMS03": "2018-09-01",
@@ -344,6 +345,7 @@ dataset_params = {
 }
 
 # %%
+# KNN = 3
 KNN = 3
 
 
@@ -750,6 +752,7 @@ estimator = LagLlamaEstimator(
     },
     use_feat_dynamic_real=True,
     mistral=True,
+    alpha=0.9,
 )
 
 BASED_CHECKPOINT_CL_96 = None
@@ -797,7 +800,8 @@ BASED_CHECKPOINT_CL_96 = None
 #      estimator.ckpt_path = BASED_CHECKPOINT_CL_96
 BASED_CHECKPOINT_CL_96 = "/home/seyed/PycharmProjects/step/lag-llama/lightning_logs/version_707/checkpoints/epoch=385-step=135100.ckpt"
 estimator.ckpt_path = BASED_CHECKPOINT_CL_96
-estimator.trainer_kwargs["max_epochs"] = 504
+# estimator.trainer_kwargs["max_epochs"] = 504
+estimator.trainer_kwargs["max_epochs"] = 387
 logger.info(f"Best pretrain model on {BASED_CHECKPOINT_CL_96}")
 # %%
 fine_tune_datasets = ["PEMS07M"]
@@ -867,7 +871,7 @@ test_dataset[0]["target"].shape
 # %%
 assert len(test_dataset) == 228
 
-estimator.trainer_kwargs["max_epochs"] = estimator.trainer_kwargs["max_epochs"] + 5
+estimator.trainer_kwargs["max_epochs"] = estimator.trainer_kwargs["max_epochs"] + 1
 predictor = estimator.train_with_module(
     fine_train_data,
     shuffle_buffer_length=None,
@@ -939,10 +943,44 @@ test_loader = estimator.create_test_dataloader(
 
 predictor.model.eval()
 
+class QuantileLoss(nn.Module):
+    """
+    α-Quantile Loss implementation.
+    
+    For a given quantile α, the loss is:
+    L(y, ŷ) = α * max(y - ŷ, 0) + (1-α) * max(ŷ - y, 0)
+    """
+    def __init__(self, alpha=0.5):
+        super().__init__()
+        self.alpha = alpha
+        
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: Predicted values
+            target: True values
+        """
+        diff = target - pred
+        return torch.mean(torch.max(self.alpha * diff, (self.alpha - 1) * diff))
+
+def quantile_loss_q(prediction, true, q):
+    diff =true - prediction
+    return ((1-q) * torch.where(diff < 0, 0, diff) + (q) * torch.where(-diff < 0, 0, -diff)).mean()
+
+def quantile_loss(prediction, true):
+    tt = []
+    quantiles = [0.1*i for i in range(1, 10)]
+    for q in quantiles:
+        tt.append(quantile_loss_q(torch.quantile(prediction, q=q, dim=1), true, q).reshape(1))
+    tt = torch.cat(tt)
+    return torch.mean(tt).detach().cpu().item()
+
+
 forecasts_ = []
 forecasts_par = []
 from time import perf_counter
 mae_metrics = []
+crps = []
 mape_metrics = []
 rmse_metrics = []
 for i, batch in enumerate(test_loader):
@@ -969,6 +1007,7 @@ for i, batch in enumerate(test_loader):
             lplc=batch["feat_static_real"].to(predictor.device),
         )
         forec = torch.median(outputs.sequences, 1)[0]
+        crps.append(quantile_loss(outputs.sequences, batch.get("future_target").to(predictor.device)))
         forecasts_.append(forec.cpu().numpy())
         forecasts_par.append(outputs.sequences.cpu().numpy())
         mae_ = MAE_torch(forec, batch.get("future_target").to(predictor.device), 0.0)[0]
@@ -1018,7 +1057,7 @@ from gluonts.time_feature import get_seasonality
 logger.info(f"MAE: {np.mean(mae_metrics)}")
 logger.info(f"RMSE: {np.mean(rmse_metrics)}")
 logger.info(f"MAPE: {np.mean(mape_metrics)}")
-
+logger.info(f"CRPS: {np.mean(crps)}")
 
 import matplotlib.dates as mdates
 
