@@ -1,3 +1,5 @@
+# from __future__ import annotations
+# from pydantic import BaseModel, Field
 from collections import namedtuple
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -62,6 +64,9 @@ from gluonts.transform.sampler import InstanceSampler
 from typing import Optional, Type
 from gluonts.transform._base import FlatMapTransformation
 
+# from torchtune.models.llama2 import llama2_7b, lora_llama2_7b
+
+
 from torch.distributions import (
     AffineTransform,
     Distribution,
@@ -70,7 +75,7 @@ from torch.distributions import (
     Independent
 )
 from gluonts.torch.distributions import DistributionOutput
-from lag_llama.gluon.lightning_module import LagLlamaLightningModule, LagLlamaDALightningModule
+from lag_llama.gluon.lightning_module import LagLlamaLightningModule, LagLlamaDALightningModule, watcher, watcher2
 from gluonts.core.component import validated
 from gluonts.dataset.common import Dataset
 from gluonts.env import env
@@ -81,6 +86,8 @@ from gluonts.transform import Transformation
 import torch.nn as nn
 from typing import NamedTuple
 from lag_llama.model.lora import lora
+from peft import PeftConfig
+
 
 
 class TrainOutput(NamedTuple):
@@ -306,6 +313,8 @@ class HFDistributionOutput:
         self.args_dim = {k: dim * self.args_dim[k] for k in self.args_dim}
 
     def _base_distribution(self, distr_args):
+        #TODO: Temporary
+        # return self.distr_cls(*distr_args)
         if self.dim == 1:
             return self.distr_cls(*distr_args)
         else:
@@ -501,6 +510,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
         ckpt_path: Optional[str] = None,
         use_feat_dynamic_real=True,
         mistral=False,
+        alpha=0.1,
     ) -> None:
         default_trainer_kwargs = {"max_epochs": 100}
         if trainer_kwargs is not None:
@@ -582,6 +592,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
 
         self.use_cosine_annealing_lr = use_cosine_annealing_lr
         self.cosine_annealing_lr_args = cosine_annealing_lr_args
+        self.alpha = alpha
         # self.transformation = self.create_transformation()
 
     def train(
@@ -676,8 +687,8 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                     ),
                 ]
             )
-
-    def create_lightning_module(self, use_kv_cache: bool = False, use_lora=True) -> pl.LightningModule:
+    
+    def param_2_dict(self):
         model_kwargs = {
             "input_size": self.input_size,
             "context_length": self.context_length,
@@ -693,11 +704,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
             "time_feat": self.time_feat,
             "dropout": self.dropout,
         }
-        if self.ckpt_path is not None and use_lora:
-            with lora(r=8, alpha=16, dropout=0.05, enabled=True):
-                module = LagLlamaLightningModule.load_from_checkpoint(
-                    checkpoint_path=self.ckpt_path,
-                    strict=False,
+        return dict(
                     loss=self.loss,
                     lr=self.lr,
                     weight_decay=self.weight_decay,
@@ -728,15 +735,81 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                     window_warp_prob=self.window_warp_prob,
                     window_warp_window_ratio=self.window_warp_window_ratio,
                     window_warp_scales=self.window_warp_scales,
-                    use_kv_cache=use_kv_cache,
+                    use_kv_cache=False,
                     data_id_to_name_map=self.data_id_to_name_map,
                     use_cosine_annealing_lr=self.use_cosine_annealing_lr,
                     cosine_annealing_lr_args=self.cosine_annealing_lr_args,
                     track_loss_per_series=self.track_loss_per_series,
                     mistral=self.mistral,
+                    alpha=self.alpha
+        )
+
+    def create_lightning_module(self, use_kv_cache: bool = False, use_lora=True) -> pl.LightningModule:
+        model_kwargs = {
+            "input_size": self.input_size,
+            "context_length": self.context_length,
+            "max_context_length": self.max_context_length,
+            "lags_seq": self.lags_seq,
+            "n_layer": self.n_layer,
+            "n_embd_per_head": self.n_embd_per_head,
+            "n_head": self.n_head,
+            "scaling": self.scaling,
+            "distr_output": self.distr_output,
+            "num_parallel_samples": self.num_parallel_samples,
+            "rope_scaling": self.rope_scaling,
+            "time_feat": self.time_feat,
+            "dropout": self.dropout,
+        }
+        if self.ckpt_path is not None and use_lora:
+            module = LagLlamaLightningModule.load_from_checkpoint(
+                checkpoint_path=self.ckpt_path,
+                strict=False,
+                loss=self.loss,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+                context_length=self.context_length,
+                prediction_length=self.prediction_length,
+                model_kwargs=model_kwargs,
+                use_feat_dynamic_real=self.use_feat_dynamic_real,
+                # Augmentations
+                aug_prob=self.aug_prob,
+                freq_mask_rate=self.freq_mask_rate,
+                freq_mixing_rate=self.freq_mixing_rate,
+                jitter_prob=self.jitter_prob,
+                jitter_sigma=self.jitter_sigma,
+                scaling_prob=self.scaling_prob,
+                scaling_sigma=self.scaling_sigma,
+                rotation_prob=self.rotation_prob,
+                permutation_prob=self.permutation_prob,
+                permutation_max_segments=self.permutation_max_segments,
+                permutation_seg_mode=self.permutation_seg_mode,
+                magnitude_warp_prob=self.magnitude_warp_prob,
+                magnitude_warp_sigma=self.magnitude_warp_sigma,
+                magnitude_warp_knot=self.magnitude_warp_knot,
+                time_warp_prob=self.time_warp_prob,
+                time_warp_sigma=self.time_warp_sigma,
+                time_warp_knot=self.time_warp_knot,
+                window_slice_prob=self.window_slice_prob,
+                window_slice_reduce_ratio=self.window_slice_reduce_ratio,
+                window_warp_prob=self.window_warp_prob,
+                window_warp_window_ratio=self.window_warp_window_ratio,
+                window_warp_scales=self.window_warp_scales,
+                use_kv_cache=use_kv_cache,
+                data_id_to_name_map=self.data_id_to_name_map,
+                use_cosine_annealing_lr=self.use_cosine_annealing_lr,
+                cosine_annealing_lr_args=self.cosine_annealing_lr_args,
+                track_loss_per_series=self.track_loss_per_series,
+                mistral=self.mistral,
+                alpha=self.alpha,
+                lora_config=LoraConfig(r=8,  # rank
+                    lora_alpha=32,
+                    target_modules=["q_proj", "k_proj", "v_proj"],
+                    lora_dropout=0.1,
+                    bias="none"
+                    )
                 )
-                module.print_trainable_parameters(module.model)
-                return module
+            module.print_trainable_parameters(module)
+            return module
         elif self.ckpt_path is not None and not use_lora:
             module = LagLlamaLightningModule.load_from_checkpoint(
                     checkpoint_path=self.ckpt_path,
@@ -777,6 +850,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                     cosine_annealing_lr_args=self.cosine_annealing_lr_args,
                     track_loss_per_series=self.track_loss_per_series,
                     mistral=self.mistral,
+                    alpha=self.alpha
                 )
             # for param in module.model.parameters():
             #     param.requires_grad = False
@@ -822,6 +896,7 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                 cosine_annealing_lr_args=self.cosine_annealing_lr_args,
                 track_loss_per_series=self.track_loss_per_series,
                 mistral=self.mistral,
+                alpha=self.alpha,
             )
 
     def _create_instance_splitter(self, module: LagLlamaLightningModule, mode: str):
@@ -1000,12 +1075,22 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
             val_dataloaders=validation_data_loader,
             ckpt_path=ckpt_path,
         )
-
+        watcher.plot_statistics("/home/seyed/PycharmProjects/step/lag-llama/results/grads")
+        watcher2.plot_statistics("/home/seyed/PycharmProjects/step/lag-llama/results/grads")
         # logger.info(f"Loading best model from {checkpoint.best_model_path}")
         if hasattr(checkpoint, "best_model_path"):
             best_model = training_network.__class__.load_from_checkpoint(
                 checkpoint.best_model_path,
                 strict=False,
+                use_lora=kwargs.get("use_lora", True),
+                **self.param_2_dict(),
+                inference=True,
+                lora_config=LoraConfig(r=8,  # rank
+                    lora_alpha=32,
+                    target_modules=["q_proj", "k_proj", "v_proj"],
+                    lora_dropout=0.1,
+                    bias="none"
+                    ) if kwargs.get("use_lora", True) else None
             )
         else:
             best_model = training_network

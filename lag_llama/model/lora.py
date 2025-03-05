@@ -49,7 +49,7 @@ import math
 from typing import Dict, List
 
 from . import module as llama
-
+from ..gluon import mistral
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -423,7 +423,7 @@ class CausalSelfAttention(llama.CausalSelfAttention):
         # useless allocations
         nn.Module.__init__(self)
         # assert config.n_embd % config.n_head == 0
-
+        print(f"LoRA: {self.lora_config}")
         # key, query, value projections for all heads, but in a batch
         self.kv_proj = MergedLinear(
             in_features=config.n_embd_per_head * config.n_head,
@@ -465,6 +465,61 @@ class CausalSelfAttention(llama.CausalSelfAttention):
         self.kv_cache = None
 
 
+class SDPMistral(mistral.MistralSdpaAttention):
+
+    def __init__(self, config=..., layer_idx = None):
+        super().__init__(config, layer_idx)
+        self.q_proj = MergedLinear(
+            in_features=config.n_embd_per_head * config.n_head,
+            out_features=config.n_embd_per_head * config.n_head,
+            r=self.lora_config.r,
+            lora_alpha=self.lora_config.alpha,
+            lora_dropout=self.lora_config.dropout,
+            enable_lora=[True],
+            fan_in_fan_out = False,
+            merge_weights=True,
+            bias=False)
+        self.k_proj = MergedLinear(
+            config.n_embd_per_head * config.n_head,
+            config.n_embd_per_head * config.n_head,
+            r=self.lora_config.r,
+            lora_alpha=self.lora_config.alpha,
+            lora_dropout=self.lora_config.dropout,
+            enable_lora=[True],
+            fan_in_fan_out = False,
+            merge_weights=True,
+            bias=False,
+        )
+        self.v_proj = MergedLinear(
+            config.n_embd_per_head * config.n_head,
+            config.n_embd_per_head * config.n_head,
+            r=self.lora_config.r,
+            lora_alpha=self.lora_config.alpha,
+            lora_dropout=self.lora_config.dropout,
+            enable_lora=[True],
+            fan_in_fan_out = False,
+            merge_weights=True,
+            bias=False,
+        )
+        # output projection
+        self.o_proj = nn.Linear(
+            config.n_embd_per_head * config.n_head,
+            config.n_embd_per_head * config.n_head,
+            bias=False,
+        )
+
+        self.n_head = config.n_head
+        self.n_embd_per_head = config.n_embd_per_head
+        self.block_size = config.block_size
+        self.dropout = config.dropout
+
+        self.rope_scaling = config.rope_scaling
+        self._rope_scaling_validation()
+
+        self._init_rope()
+        self.kv_cache = None
+
+
 @contextmanager
 def lora(r, alpha, dropout, enabled: bool = True):
     """Apply context manager under which you can instantiate the model with LoRA.
@@ -484,13 +539,16 @@ def lora(r, alpha, dropout, enabled: bool = True):
     if not enabled:
         yield
         return
-    CausalSelfAttention.lora_config = LoRAConfig(r=r, alpha=alpha, dropout=dropout)
+    SDPMistral.lora_config = LoRAConfig(r=r, alpha=alpha, dropout=dropout)
     # when entering context manager replace link to causal self-attention class from original
     # to a variant with LoRA
-    causal_self_attention = llama.CausalSelfAttention
-    llama.CausalSelfAttention = CausalSelfAttention
+    # causal_self_attention = llama.CausalSelfAttention
+    causal_self_attention = mistral.MistralSdpaAttention
+    # llama.CausalSelfAttention = CausalSelfAttention
+    mistral.MistralSdpaAttention = SDPMistral
     yield
     # when exiting context manager - restore link to original causal self-attention class
-    llama.CausalSelfAttention = causal_self_attention
+    # llama.CausalSelfAttention = causal_self_attention
+    mistral.MistralSdpaAttention = causal_self_attention
 
-    CausalSelfAttention.lora_config = None
+    SDPMistral.lora_config = None

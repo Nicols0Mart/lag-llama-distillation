@@ -3,6 +3,7 @@
 
 # %%
 import itertools
+import math
 from gluonts.dataset.common import MetaData
 from typing import List, Optional, Callable, Iterable
 from itertools import islice
@@ -10,8 +11,8 @@ import json, sys
 import pickle
 import os, random
 import scipy.sparse as sp
-import metrics
 import torch_metrics
+import metrics
 import copy
 import numpy as np
 import pandas as pd
@@ -34,21 +35,15 @@ from gluonts.transform import (
     InstanceSplitter,
     ExpectedNumInstanceSampler,
     TestSplitSampler,
-    InstanceSampler,
+    InstanceSampler
 )
-from gluonts.dataset.split import OffsetSplitter
-
 from gluonts.evaluation import make_evaluation_predictions, Evaluator
-
 # from gluonts.torch.model.tft.module import TemporalFusionTransformerModel
 # from gluonts.mx.trainer import Trainer
 from gluonts.dataset.common import ListDataset
 from gluonts.dataset.common import (
-    FileDataset,
-    ListDataset,
-    TrainDatasets,
-    CategoricalFeatureInfo,
-    BasicFeatureInfo,
+    FileDataset, ListDataset, TrainDatasets,
+    CategoricalFeatureInfo, BasicFeatureInfo,
 )
 from gluonts.dataset.loader import TrainDataLoader, InferenceDataLoader
 from gluonts.evaluation.backtest import make_evaluation_predictions
@@ -59,9 +54,11 @@ from gluonts.dataset.common import ListDataset
 from gluonts.dataset.repository.datasets import get_dataset
 from datasets import Dataset, Features, Value, Sequence
 from pandas.tseries.frequencies import to_offset
+import argparse
+
 import logging, time
 
-from plot_utils import plot_fill_between
+JUST_K = True
 
 logging.basicConfig(
     filename=f"training_fold_{str(int(time.time()))}_debug.log",
@@ -72,46 +69,54 @@ logger = logging.getLogger(__name__)
 
 # %%
 os.environ["PYDEVD_DISABLE_FILE_VALIDATION"] = "1"
-JUST_K = True
+
 # %%
-all_train_dataset_names = [["PEMS03"], ["PEMS04"], ["PEMS07"], ["PEMS08"]]
-# train_dataset_names = ["PEMS03", "PEMS04", "PEMS07", "PEMS08"]
-# train_dataset_names = ["PEMS03",]
-test_datasets = ["PEMS07M"]
+train_dataset_names = ["PEMS03", "PEMS07", "PEMS08", "PEMS04"]
+# train_dataset_names = ["PEMS04"]
+# test_datasets = ["PEMS07M"]
+test_datasets = ["crowd"]
 data_id_to_name_map = {}
-name_to_data_id_map = {}
+name_to_data_id_map  = {}
 dataset_paths = {
-    "PEMS03": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS03/PEMS03.npz",
-    "PEMS04": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS04/PEMS04.npz",
-    "PEMS07": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS07/PEMS07.npz",
-    "PEMS08": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS08/PEMS08.npz",
-    "PEMS07M": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS07M/PEMS07M.npz",
-    "crowd": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS07M/PEMS07M.npz",
+     "PEMS03": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS03/PEMS03.npz",
+     "PEMS04": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS04/PEMS04.npz",
+     "PEMS07": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS07/PEMS07.npz",
+     "PEMS08": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS08/PEMS08.npz",
+     "PEMS07M": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS07M/PEMS07M.npz",
+     "crowd": "/home/seyed/PycharmProjects/step/STEP/datasets/Bru/merged_data.csv",
 }
 starts = {
-    "PEMS03": "2018-09-01",
-    "PEMS04": "2018-01-01",
-    "PEMS07": "2017-05-01",
-    "PEMS08": "2016-07-01",
-    "PEMS07M": "2016-07-01",
+     "PEMS03": "2018-09-01",
+     "PEMS04": "2018-01-01",
+     "PEMS07": "2017-05-01",
+     "PEMS08": "2016-07-01",
+     "PEMS07M": "2016-07-01",
+     "crowd": "2021-05-14 05:30:00",
 }
-for train_dataset_names in all_train_dataset_names:
-    for data_id, name in enumerate(train_dataset_names):
-        data_id_to_name_map[data_id] = name
-        name_to_data_id_map[name] = data_id
+
+# crowd -> "2020-11-11 00:30:00", '2021-04-05 16:00:00'
+node_dict = {}
+node_dict['PEMS08'], node_dict['PEMS07'], node_dict['PEMS04'], node_dict['PEMS03'], node_dict['PEMS07M'] = 170, 883, 307, 358, 228
+node_dict["crowd"] = 207
+for data_id, name in enumerate(train_dataset_names):
+     data_id_to_name_map[data_id] = name
+     name_to_data_id_map[name] = data_id
 test_data_id = -1
 for name in test_datasets:
-    data_id_to_name_map[test_data_id] = name
-    name_to_data_id_map[name] = test_data_id
-    test_data_id -= 1
+     data_id_to_name_map[test_data_id] = name
+     name_to_data_id_map[name] = test_data_id
+     test_data_id -= 1
 
 # %% [markdown]
 # ### Pretraining load dataset
 
 # %%
 
-
-def create_train_dataset_without_last_k_timesteps(raw_train_dataset, freq, k=0):
+def create_train_dataset_without_last_k_timesteps(
+    raw_train_dataset,
+    freq,
+    k=0
+):
     train_data = []
     for i, series in enumerate(raw_train_dataset):
         s_train = series.copy()
@@ -128,7 +133,7 @@ class CombinedDatasetIterator:
         self._datasets = [iter(el) for el in datasets]
         self._weights = weights
         self._rng = random.Random(seed)
-
+        
     def __next__(self):
         (dataset,) = self._rng.choices(self._datasets, weights=self._weights, k=1)
         return next(dataset)
@@ -148,7 +153,7 @@ class CombinedDataset:
 
     def __len__(self):
         return sum([len(ds) for ds in self._datasets])
-
+    
 
 class SingleInstanceSampler(InstanceSampler):
     """
@@ -197,7 +202,11 @@ def _count_timesteps(
             )
 
 
-def create_train_dataset_last_k_percentage(raw_train_dataset, freq, k=100):
+def create_train_dataset_last_k_percentage(
+    raw_train_dataset,
+    freq,
+    k=100
+):
     # Get training data
     train_data = []
     for i, series in enumerate(raw_train_dataset):
@@ -279,75 +288,46 @@ def get_adjacency_matrix(distance_df_filename, num_of_vertices, id_filename=None
                     distaneA[i, j] = distance
             return A, distaneA
 
+def batch_cosine_similarity(x, y):
+    # 计算分母
+    l2_x = torch.norm(x, dim=2, p=2) + 1e-7  # avoid 0, l2 norm, num_heads x batch_size x hidden_dim==>num_heads x batch_size
+    l2_y = torch.norm(y, dim=2, p=2) + 1e-7  # avoid 0, l2 norm, num_heads x batch_size x hidden_dim==>num_heads x batch_size
+    l2_m = torch.matmul(l2_x.unsqueeze(dim=2), l2_y.unsqueeze(dim=2).transpose(1, 2))
+    # 计算分子
+    l2_z = torch.matmul(x, y.transpose(1, 2))
+    # cos similarity affinity matrix
+    cos_affnity = l2_z / l2_m
+    adj = cos_affnity
+    return adj
 
-# %%
+def batch_dot_similarity(x, y):
+    QKT = torch.bmm(x, y.transpose(-1, -2)) / math.sqrt(x.shape[2])
+    W = torch.softmax(QKT, dim=-1)
+    return W
 
-
-# %%
-# # from gluonts.dataset.multivariate_grouper import MultivariateGrouper
-
-# grouper = MultivariateGrouper(max_target_dim=3)
-
-
-def weight_matrix(file_path, sigma2=0.1, epsilon=0.5, scaling=True):
+def get_k_nn_neighbor(data, k=11*207, metric="cosine"):
     """
-    From STGCN-IJCAI2018
-    Load weight matrix function.
-    :param file_path: str, the path of saved weight matrix file.
-    :param sigma2: float, scalar of matrix W.
-    :param epsilon: float, thresholds to control the sparsity of matrix W.
-    :param scaling: bool, whether applies numerical scaling on W.
-    :return: np.ndarray, [n_route, n_route].
+    data: tensor B, N, D
+    metric: cosine or dot
     """
-    try:
-        W = pd.read_csv(file_path, header=None).values
-    except FileNotFoundError:
-        logger.info(f"ERROR: input file was not found in {file_path}.")
 
-    # check whether W is a 0/1 matrix.
-    if set(np.unique(W)) == {0, 1}:
-        logger.info('The input graph is a 0/1 matrix; set "scaling" to False.')
-        scaling = False
-
-    if scaling:
-        n = W.shape[0]
-        W = W / 10000.0
-        W2, WMASK = W * W, np.ones([n, n]) - np.identity(n)
-        # refer to Eq.10
-        A = np.exp(-W2 / sigma2) * (np.exp(-W2 / sigma2) >= epsilon) * WMASK
-        return A
+    if metric == "cosine":
+        batch_sim = batch_cosine_similarity(data, data)
+    elif metric == "dot":
+        batch_sim = batch_dot_similarity(data, data)    # B, N, N
     else:
-        return W
-
-
-# %%
-dataset_params = {
-    "PEMS07M": {
-        "file": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS07M/PEMS07M.csv",
-        "args": {},
-    },
-    "PEMS07": {
-        "file": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS07/PEMS07.csv",
-        "args": {},
-    },
-    "PEMS08": {
-        "file": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS08/PEMS08.csv",
-        "args": {},
-    },
-    "PEMS03": {
-        "file": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS03/PEMS03.csv",
-        "args": {
-            "id_filename": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS03/PEMS03.txt"
-        },
-    },
-    "PEMS04": {
-        "file": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS04/PEMS04.csv",
-        "args": {},
-    },
-}
+        assert False, "unknown metric"
+    batch_size, num_nodes, _ = batch_sim.shape
+    adj = batch_sim.view(batch_size, num_nodes*num_nodes)
+    res = torch.zeros_like(adj)
+    top_k, indices = torch.topk(adj, k, dim=-1)
+    res.scatter_(-1, indices, top_k)
+    adj = torch.where(res != 0, 1.0, 0.0).detach().clone()
+    adj = adj.view(batch_size, num_nodes, num_nodes)
+    adj.requires_grad = False
+    return adj
 
 # %%
-# KNN = 3
 KNN = 3
 
 
@@ -365,7 +345,10 @@ def load_pickle(pickle_file):
 
 
 def calculate_normalized_laplacian(adj):
-    adj = sp.coo_matrix(adj)
+    try:
+        adj = sp.coo_matrix(adj)
+    except:
+        adj = sp.coo_matrix(adj.squeeze(0))
     d = np.array(adj.sum(1))
     isolated_point_num = np.sum(np.where(d, 0, 1))
     logger.info(f"Number of isolated points: {isolated_point_num}")
@@ -382,7 +365,10 @@ def calculate_normalized_laplacian(adj):
 
 def cal_lape(adj_mx):
     lape_dim = 32
-    L, isolated_point_num = calculate_normalized_laplacian(adj_mx)
+    try:
+        L, isolated_point_num = calculate_normalized_laplacian(adj_mx)
+    except:
+        L, isolated_point_num = calculate_normalized_laplacian(adj_mx)
     EigVal, EigVec = np.linalg.eig(L.toarray())
     idx = EigVal.argsort()
     EigVal, EigVec = EigVal[idx], np.real(EigVec[:, idx])
@@ -392,7 +378,11 @@ def cal_lape(adj_mx):
 
 
 def pems_loader(path):
-    df_pems4 = np.load(path)["data"]
+    try:
+        df_pems4 = np.load(path)["data"]
+    except:
+        df_pems4 = pd.read_csv('/home/seyed/PycharmProjects/step/STEP/datasets/Bru/merged_data.csv', index_col=0, parse_dates=True)
+        df_pems4.columns = range(df_pems4.shape[1])
     try:
         df_pems4_new = pd.DataFrame(df_pems4[:, :, 0])
     except:
@@ -434,7 +424,17 @@ def dataset_factory_pems(
 
     def to_deepar_format(dataframe, time_feature, index=None, dataset_name="PEMS04"):
         freq = "5min"
-        start_index = datetime.datetime.strptime(date, "%Y-%m-%d")
+        try:
+            start_index = datetime.datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            #crowd
+            logger.error("Invalid date format. Please provide date in the format 'YYYY-MM-DD'")
+            start_index = datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S")
+            freq = "5min"
+        # if fold_size is not None:
+        #     dataframe, ind = take_random_fold(dataframe, int(fold_size*dataframe.shape[0]))
+        #     date_per = pd.Timestamp(date).to_period(freq=freq) + ind
+        #     start_index = date_per.to_timestamp().to_pydatetime()
         # day_data, week_data, _ = time_add(dataframe, **dataset_params[dataset_name])
         # if len(dataframe.shape) == 2:
         #     data = np.expand_dims(data, axis=-1)
@@ -446,11 +446,14 @@ def dataset_factory_pems(
         #     day_data = np.expand_dims(day_data, axis=-1).astype(int)
         #     week_data = np.expand_dims(week_data, axis=-1).astype(int)
         #     data_time_related = np.concatenate([day_data, week_data], axis=-1)
-        A, _ = get_adjacency_matrix(
-            dataset_params[dataset_name]["file"],
-            num_of_vertices=node_dict[dataset_name],
-            **dataset_params[dataset_name]["args"],
-        )
+        if name != "PEMS07M" and name != "crowd":
+            A, _ = get_adjacency_matrix(dataset_params[dataset_name]["file"], num_of_vertices=node_dict[dataset_name], **dataset_params[dataset_name]["args"])
+        elif name == "crowd":
+            A = get_k_nn_neighbor(torch.from_numpy(loaded_df.values).float().unsqueeze(0).transpose(1,2), k=KNN).numpy()
+            A = A + np.eye(A.shape[0])
+        else:
+            A = weight_matrix(dataset_params[dataset_name]["file"]).astype(np.float32)
+            A = A + np.eye(A.shape[0])
         lpls = cal_lape(A.copy())
         if windows:
             data = [
@@ -490,11 +493,10 @@ def dataset_factory_pems(
         )
 
     train_data_lds_04 = to_deepar_format(train_data_04, feat_time_04, dataset_name=name)
-    test_data_lds_04 = to_deepar_format(loaded_df, aggregated_04, dataset_name=name)
-    meta_data = MetaData(freq="5T", prediction_length=future_seq_len)
-    raw_train_dataset = TrainDatasets(
-        train=train_data_lds_04, test=test_data_lds_04, metadata=meta_data
-    )
+    test_data_lds_04 = to_deepar_format(loaded_df, aggregated_04, dataset_name=name,)
+    meta_freq = "5T"
+    meta_data = MetaData(freq=meta_freq, prediction_length=future_seq_len)
+    raw_train_dataset = TrainDatasets(train=train_data_lds_04, test=test_data_lds_04, metadata=meta_data)
     max_train_end_date = None
     timestep_delta = pd.tseries.frequencies.to_offset(freq)
     # Get training data
@@ -580,6 +582,58 @@ def dataset_factory_pems(
 
 
 # %%
+dataset_params = {
+            "PEMS07M":{
+                "file":"/home/seyed/PycharmProjects/step/FlashST/data/PEMS07M/PEMS07M.csv",
+                "args":{}
+            },
+            "PEMS07":{
+                "file": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS07/PEMS07.csv",
+                "args":{}
+            },
+            "PEMS08":{
+                "file":"/home/seyed/PycharmProjects/step/FlashST/data/PEMS08/PEMS08.csv",
+                "args":{}
+            },
+            "PEMS03":{
+                "file": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS03/PEMS03.csv",
+                "args": {"id_filename":"/home/seyed/PycharmProjects/step/FlashST/data/PEMS03/PEMS03.txt"}
+            },
+            "PEMS04":{
+                "file": "/home/seyed/PycharmProjects/step/FlashST/data/PEMS04/PEMS04.csv",
+                "args": {}
+            },
+        }
+
+def weight_matrix(file_path, sigma2=0.1, epsilon=0.5, scaling=True):
+    '''
+    From STGCN-IJCAI2018
+    Load weight matrix function.
+    :param file_path: str, the path of saved weight matrix file.
+    :param sigma2: float, scalar of matrix W.
+    :param epsilon: float, thresholds to control the sparsity of matrix W.
+    :param scaling: bool, whether applies numerical scaling on W.
+    :return: np.ndarray, [n_route, n_route].
+    '''
+    try:
+        W = pd.read_csv(file_path, header=None).values
+    except FileNotFoundError:
+        print(f'ERROR: input file was not found in {file_path}.')
+
+    # check whether W is a 0/1 matrix.
+    if set(np.unique(W)) == {0, 1}:
+        print('The input graph is a 0/1 matrix; set "scaling" to False.')
+        scaling = False
+
+    if scaling:
+        n = W.shape[0]
+        W = W / 10000.
+        W2, WMASK = W * W, np.ones([n, n]) - np.identity(n)
+        # refer to Eq.10
+        A = np.exp(-W2 / sigma2) * (np.exp(-W2 / sigma2) >= epsilon) * WMASK
+        return A
+    else:
+        return W
 
 
 def test_dataset_factory_pems(
@@ -618,7 +672,13 @@ def test_dataset_factory_pems(
         dataframe, time_feature, index=None, dataset_name="PEMS04", knn_map=None
     ):
         freq = "5min"
-        start_index = datetime.datetime.strptime(date, "%Y-%m-%d")
+        try:
+            start_index = datetime.datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            #crowd
+            logger.error("Invalid date format. Please provide date in the format 'YYYY-MM-DD'")
+            start_index = datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S")
+            freq = "5min"
         # day_data, week_data, _ = time_add(dataframe, **dataset_params[dataset_name])
         # if len(dataframe.shape) == 2:
         #     data = np.expand_dims(data, axis=-1)
@@ -630,12 +690,11 @@ def test_dataset_factory_pems(
         #     day_data = np.expand_dims(day_data, axis=-1).astype(int)
         #     week_data = np.expand_dims(week_data, axis=-1).astype(int)
         #     data_time_related = np.concatenate([day_data, week_data], axis=-1)
-        if name != "PEMS07M":
-            A, _ = get_adjacency_matrix(
-                dataset_params[dataset_name]["file"],
-                num_of_vertices=node_dict[dataset_name],
-                **dataset_params[dataset_name]["args"],
-            )
+        if name != "PEMS07M" and name != "crowd":
+            A, _ = get_adjacency_matrix(dataset_params[dataset_name]["file"], num_of_vertices=node_dict[dataset_name], **dataset_params[dataset_name]["args"])
+        elif name == "crowd":
+            A = get_k_nn_neighbor(torch.from_numpy(loaded_df.values).float().unsqueeze(0).transpose(1,2), k=KNN).numpy()
+            A = A + np.eye(A.shape[0])
         else:
             A = weight_matrix(dataset_params[dataset_name]["file"]).astype(np.float32)
             A = A + np.eye(A.shape[0])
@@ -690,7 +749,7 @@ def test_dataset_factory_pems(
     train_data = create_train_dataset_without_last_k_timesteps(
         test_data, freq=freq, k=24
     )
-    meta_data = MetaData(freq="5T", prediction_length=future_seq_len)
+    meta_data = MetaData(freq="30T", prediction_length=future_seq_len)
     raw_train_dataset = TrainDatasets(
         train=train_data, test=test_data, metadata=meta_data
     )
@@ -722,7 +781,6 @@ def test_dataset_factory_pems(
 # %%
 all_datasets, val_datasets, dataset_num_series = [], [], []
 dataset_train_num_points, dataset_val_num_points = [], []
-
 from lag_llama.gluon.estimator import LagLlamaEstimator
 
 ckpt = torch.load("checkpoints/lag-llama.ckpt", map_location=torch.device("cuda:0"))
@@ -739,7 +797,7 @@ BASED_CHECKPOINT_CL_96 = "/home/seyed/PycharmProjects/step/lag-llama/lightning_l
 
 estimator = LagLlamaEstimator(
     ckpt_path=None,
-    prediction_length=12,
+    prediction_length=30,
     context_length=48 * 2,
     # estimator args
     input_size=estimator_args["input_size"],
@@ -806,7 +864,8 @@ estimator.ckpt_path = BASED_CHECKPOINT_CL_96
 estimator.trainer_kwargs["max_epochs"] = 387
 logger.info(f"Best pretrain model on {BASED_CHECKPOINT_CL_96}")
 # %%
-fine_tune_datasets = ["PEMS07M"]
+# fine_tune_datasets = ["PEMS07M"]
+fine_tune_datasets = ["crowd"]
 fine_all_datasets, fine_val_datasets, fine_dataset_num_series = [], [], []
 fine_dataset_train_num_points, fine_dataset_val_num_points = [], []
 for data_id, name in enumerate(fine_tune_datasets):
@@ -838,7 +897,7 @@ for data_id, name in enumerate(fine_tune_datasets):
         max_train_end_date,
         total_points,
     ) = dataset_factory_pems(
-        loaded_df=pems_loader(dataset_paths[name]), date=starts[name], data_id=data_id
+        loaded_df=pems_loader(dataset_paths[name]), date=starts[name], data_id=data_id, name=name
     )
     logger.info(
         "Dataset:"
@@ -861,37 +920,42 @@ fine_train_data = fine_all_datasets[0]
 fine_val_data = fine_train_data
 # %%
 test_dataset = test_dataset_factory_pems(
-    loaded_df=pems_loader(dataset_paths["PEMS07M"]),
-    date=starts["PEMS07M"],
+    loaded_df=pems_loader(dataset_paths["crowd"]),
+    date=starts["crowd"],
     data_id=-1,
-    name="PEMS07M",
+    name="crowd",
 )
 
 # %%
 test_dataset[0]["target"].shape
 
 # %%
-assert len(test_dataset) == 228
+try:
+    assert len(test_dataset) == 228
+    logger.warning("Test dataset has not! 228 series")
+except AssertionError:
+    assert len(test_dataset) == 207
 
-estimator.trainer_kwargs["max_epochs"] = estimator.trainer_kwargs["max_epochs"] + 50
-use_lora = True
+estimator.trainer_kwargs["max_epochs"] = estimator.trainer_kwargs["max_epochs"] + 1
 predictor = estimator.train_with_module(
     fine_train_data,
     shuffle_buffer_length=None,
     ckpt_path=BASED_CHECKPOINT_CL_96,
-    use_lora=use_lora,
+    use_lora=False,
 )
-LORA_LABEL = {
-    True: "LORA",
-    False: "NoLORA",
-}
-logger.info(f"{LORA_LABEL[use_lora]} lora, Fine-tuning on {fine_tune_datasets} with {estimator.trainer_kwargs['max_epochs']} epochs")
+logger.info("use_lora=False")
 # estimator.ckpt_path = BEST
 
+try:
+    logger.info("Fine tuning on Brussels dataset, Best checkpoint is : " + str(predictor.trainer.checkpoint_callback.best_model_path))
+except Exception as e:
+    logger.info("Fine tuning on Brussels dataset"+ str(e))
 
 def MAE_torch(pred, true, mask_value=None):
     if mask_value != None:
-        mask = torch.gt(true, mask_value)
+        qq = torch.ones_like(true)
+        qq[:, 0:15, :] = 0
+        mask = (torch.gt(true, mask_value) & qq.long()).bool()
         pred = torch.masked_select(pred, mask)
         true = torch.masked_select(true, mask)
     mae_loss = torch.abs(true - pred)
@@ -901,7 +965,9 @@ def MAE_torch(pred, true, mask_value=None):
 
 def RMSE_torch(pred, true, mask_value=None):
     if mask_value != None:
-        mask = torch.gt(true, mask_value)
+        qq = torch.ones_like(true)
+        qq[:, 0:15, :] = 0
+        mask = (torch.gt(true, mask_value) & qq.long()).bool()
         pred = torch.masked_select(pred, mask)
         true = torch.masked_select(true, mask)
     return torch.sqrt(torch.mean((pred - true) ** 2))
@@ -1014,28 +1080,6 @@ for i, batch in enumerate(test_loader):
             lplc=batch["feat_static_real"].to(predictor.device),
         )
         forec = torch.median(outputs.sequences, 1)[0]
-        # y1 = torch.quantile(outputs.sequences,0.1, 1)
-        # y2 = torch.quantile(outputs.sequences,0.9, 1)
-        # for j in range(16):
-        #     if i<=14:
-        #         for k in range(0,3):
-        #             x = batch.get("past_target")[j, -32:, k].numpy()
-        #             y = batch["future_target"].cpu().numpy()[j, : , k]
-        #             plot_fill_between(
-        #                 np.arange(0, len(y)+len(x)),
-        #                 np.concatenate((x, y)), forec[j,:,k].cpu().numpy(), 
-        #                 y1.cpu().numpy()[j, : , k], 
-        #                 y2.cpu().numpy()[j, : , k],
-        #                 i, j, k
-        #                 )
-        #         # k = 2
-        #         # plot_fill_between(
-        #         #     np.arange(0, len(y)+len(x)),
-        #         #     np.concatenate((x, y)), forec[j,:,k].cpu().numpy(), 
-        #         #     y1.cpu().numpy()[j, : , k], 
-        #         #     y2.cpu().numpy()[j, : , k],
-        #         #     i, j, k
-        #         #     )
         crps.append(quantile_loss(outputs.sequences, batch.get("future_target").to(predictor.device)))
         forecasts_.append(forec.cpu().numpy())
         forecasts_par.append(outputs.sequences.cpu().numpy())

@@ -18,7 +18,8 @@ from gluonts.core.component import validated
 from gluonts.itertools import prod
 from gluonts.torch.modules.loss import DistributionLoss, NegativeLogLikelihood
 from gluonts.torch.util import repeat_along_dim, take_last
-
+from torch.nn import KLDivLoss
+from torch.distributions import Gamma, kl_divergence
 from data.augmentations.freq_mask import freq_mask
 from data.augmentations.freq_mix import freq_mix
 from data.augmentations.augmentations import (
@@ -38,7 +39,7 @@ from gluon_utils.gluon_ts_distributions.implicit_quantile_network import (
     ImplicitQuantileNetworkOutput,
 )
 
-from lag_llama.model.module import LagLlamaModel, LLMMistralModel, LagLlamaDAModel
+from lag_llama.model.module import LagLlamaModel, LLMMistralModel, LagLlamaDAModel, watcher, watcher2
 from peft.tuners import lora
 from dataclasses import dataclass, field
 from functools import reduce
@@ -223,6 +224,139 @@ def create_loraplus_optimizer(
     return optimizer
 
 
+
+def student_t_to_gamma(nu, mu=0.0, sigma=1.0):
+    """
+    Convert Student's t-distribution parameters to equivalent Gamma distribution parameters.
+    
+    The conversion is based on matching moments between the distributions.
+    For a Student's t-distribution with nu degrees of freedom:
+    - Mean = mu (for nu > 1)
+    - Variance = [sigma^2 * nu/(nu-2)] (for nu > 2)
+    
+    Args:
+        nu (torch.Tensor): Degrees of freedom (must be > 2)
+        mu (torch.Tensor, optional): Location parameter. Defaults to 0.0
+        sigma (torch.Tensor, optional): Scale parameter. Defaults to 1.0
+        
+    Returns:
+        tuple: (alpha, beta) parameters for the Gamma distribution
+    """
+    if isinstance(nu, (float, int)):
+        nu = torch.tensor(float(nu))
+    if isinstance(mu, (float, int)):
+        mu = torch.tensor(float(mu))
+    if isinstance(sigma, (float, int)):
+        sigma = torch.tensor(float(sigma))
+
+    # Check constraints
+    # if torch.any(nu <= 2):
+    #     raise ValueError("Degrees of freedom (nu) must be > 2 for finite variance")
+    # if torch.any(sigma <= 0):
+    #     raise ValueError("Scale parameter (sigma) must be positive")
+
+    # Calculate gamma parameters
+    # For Student's t, variance = [sigma^2 * nu/(nu-2)]
+    # For Gamma(alpha, beta), mean = alpha/beta, variance = alpha/beta^2
+
+    # Match the first two moments
+    variance = sigma**2 * nu/(nu-2)
+    mean = mu
+
+    # For Gamma distribution:
+    # mean = alpha/beta
+    # variance = alpha/beta^2
+
+    # Solving these equations:
+    # beta = alpha/mean
+    # variance = mean^2/alpha
+
+    alpha = mean**2 / variance
+    beta = alpha / mean
+
+    return alpha, beta
+
+
+class TStudentKLDivLoss(nn.Module):
+    """
+    KL Divergence loss for multivariate Student's t-distribution in time series forecasting.
+    
+    This implements KL(P||Q) where:
+    - P is the target distribution (ground truth)
+    - Q is the predicted distribution
+    """
+    def __init__(self, reduction='mean', base_dist: torch.distributions.Distribution =None):
+        super().__init__()
+        self.reduction = reduction
+        self.base_dist = base_dist
+        
+    def forward(self, pred_distribution, target):
+        """
+        Compute KL divergence between predicted t-distribution and target.
+        
+        Args:
+            pred_distribution: Student's t-distribution from model output
+            target: Ground truth values
+            
+        Returns:
+            KL divergence loss
+        """
+        df1 = pred_distribution.df  # degrees of freedom
+        loc1 = pred_distribution.loc  # location
+        scale1 = pred_distribution.scale.clamp_min(1e-6)  # scale with numerical stability
+        
+        # For empirical distribution (treating target as the mean of another t-distribution)
+        df2 = df1.detach()  # use same df but detached
+        loc2 = target
+        scale2 = torch.ones_like(target) * scale1.mean().detach()
+         # Compute terms of KL divergence for Student's t-distribution
+        # Based on the formula from "Kullback-Leibler Divergence for Multivariate t-Distribution"
+        
+        # Term 1: Log ratio of gamma functions
+        term1 = (torch.lgamma((df1 + 1) / 2) - torch.lgamma(df1 / 2) - 
+                 torch.lgamma((df2 + 1) / 2) + torch.lgamma(df2 / 2))
+        
+        # Term 2: Log ratio of determinants
+        term2 = torch.log(scale2/scale1)
+        
+        # Term 3: Degrees of freedom related term
+        term3 = df1/2 * torch.log(df1) - df2/2 * torch.log(df2)
+        
+        # Term 4: Location and scale difference term
+        diff = (loc1 - loc2) / scale1
+        term4 = ((df1 + 1) / 2) * torch.log(1 + (diff ** 2) / df1)
+        
+        # Combine terms
+        kl_div = term1 + term2 + term3 + term4
+        
+        # Handle reduction
+        if self.reduction == 'none':
+            return kl_div
+        elif self.reduction == 'mean':
+            return kl_div.mean()
+        else:  # sum
+            return kl_div.sum()
+
+
+class LoRALayer(torch.nn.Module):
+    def __init__(self, in_dim, out_dim, rank, alpha):
+        super().__init__()
+        std_dev = 1 / torch.sqrt(torch.tensor(rank).float())
+        self.A = torch.nn.Parameter(torch.randn(in_dim, rank) * std_dev)
+        self.B = torch.nn.Parameter(torch.zeros(rank, out_dim))
+        self.alpha = alpha
+
+    def init_weights(self):
+        import math
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        nn.init.zeros_(self.B)
+
+    def forward(self, x):
+        x = self.alpha * (x @ self.A @ self.B)
+        return x
+
+
+
 class LagLlamaLightningModule(pl.LightningModule):
     """
     A ``pl.LightningModule`` class that can be used to train a
@@ -252,7 +386,7 @@ class LagLlamaLightningModule(pl.LightningModule):
         all_param = 0
         for name, param in model.named_parameters():
             if "lora" in name:
-                print(name, param)
+                print(name)
             all_param += param.numel()
             if param.requires_grad:
                 trainable_params += param.numel()
@@ -298,12 +432,14 @@ class LagLlamaLightningModule(pl.LightningModule):
         use_kv_cache: bool = True,
         mistral=False,
         use_feat_dynamic_real=False,
+        alpha=0.1,
+        lora_config:LoraConfig = None,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.context_length = self.hparams.context_length
         self.prediction_length = self.hparams.prediction_length
-        model = LagLlamaModel(**self.hparams.model_kwargs) if not mistral else LLMMistralModel(**self.hparams.model_kwargs)         
+        model =  LagLlamaModel(**self.hparams.model_kwargs) if not mistral else LLMMistralModel(**self.hparams.model_kwargs)         
         # lora_model = model
         self.model = model
         self.use_feat_dynamic_real = use_feat_dynamic_real
@@ -410,6 +546,19 @@ class LagLlamaLightningModule(pl.LightningModule):
                     )
 
         self.augmentations = ApplyAugmentations(self.transforms)
+        self.alpha = alpha
+        self.lora_config = lora_config
+        # or LoraConfig(
+        #     r=8,  # rank
+        #     lora_alpha=32,
+        #     target_modules=["query", "value"],
+        #     lora_dropout=0.1,
+        #     bias="none"
+        # )
+        # Apply LoRA to the model
+        if self.lora_config:
+            self.lora_layers = self.add_lora_layers(self.lora_config.lora_rank, self.lora_config.lora_alpha)
+            # self.model = get_peft_model(self.base_model, self.lora_config)
 
     # def visualize():
     #     import numpy as np
@@ -628,8 +777,21 @@ class LagLlamaLightningModule(pl.LightningModule):
                 ).sum() / observed_values.sum().clamp_min(1.0)
             else:
                 # loss = self.loss(distr, target) * observed_values
-                loss = self.loss(distr, target)
-                # loss = self.loss(distr, target) + 10.5 * distr.entropy()
+                loss = self.loss(distr, target) #***Origi***
+        #         scale1 = pred_distribution.scale.clamp_min(1e-6)  # scale with numerical stability
+        
+        # # For empirical distribution (treating target as the mean of another t-distribution)
+        # df2 = df1.detach()  # use same df but detached
+        # loc2 = target
+        # scale2 = torch.ones_like(target) * scale1.mean().detach()
+                # conc_1, rate_1 = student_t_to_gamma(bk.df.clamp_min(1e-6), loc, scale.clamp_min(1e-6)) 
+                # conc_2, rate_2 = student_t_to_gamma(bk.df.clamp_min(1e-6), target, scale.clamp_min(1e-6)) 
+                # p = Gamma(torch.nan_to_num(conc_1, nan=1e-5).clamp_min(2+1e-6), torch.nan_to_num(rate_1, nan=1e-5).clamp_min(2+1e-6))
+                # q = Gamma(torch.where(torch.isnan(conc_2), torch.full_like(conc_2, 1e-5), conc_2.clamp_min(2+1e-6)), torch.where(torch.isnan(rate_2), torch.full_like(rate_2, 1e-5), rate_2.clamp_min(2+1e-6)))
+                # kl_div = kl_divergence(p, q)
+                # # kl_div = TStudentKLDivLoss(base_dist=type(self.model.distr_output.distribution(distr_args)))
+                # # kl_loss = kl_div(self.model.distr_output.distribution(distr_args), target)
+                # loss = self.alpha * self.loss(distr, target) + (1-self.alpha) * kl_div.mean(-1)
                 # loss = distr.entropy()
 
         if not return_observed_values:
@@ -840,6 +1002,112 @@ class LagLlamaLightningModule(pl.LightningModule):
         return SampleTSPredictionOutput(
             sequences=concat_future_samples
         )
+    
+    def add_lora_layers(self, rank, alpha):
+        lora_layers = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                lora_layers.append(LoRALayer(module, rank, alpha))
+        return lora_layers
+    
+    @classmethod
+    def load_from_checkpoint(cls: "LagLlamaLightningModule", checkpoint_path, map_location = None, hparams_file = None, strict = None, **kwargs):
+        if kwargs.get("lora_config"):
+            # lora_config = kwargs.get("lora_config")
+            # new_model = get_peft_model(model.model, lora_config)
+            # model.model = new_model
+            checkpoint = torch.load(checkpoint_path, map_location=map_location)
+            mod = dict(
+                    loss=kwargs.get("loss"),
+                    lr=kwargs.get("lr"),
+                    weight_decay=kwargs.get("weight_decay"),
+                    context_length=kwargs.get("context_length"),
+                    prediction_length=kwargs.get("prediction_length"),
+                    model_kwargs=kwargs.get("model_kwargs"),
+                    # Augmentations
+                    aug_prob=kwargs.get("aug_prob"),
+                    freq_mask_rate=kwargs.get("freq_mask_rate"),
+                    freq_mixing_rate=kwargs.get("freq_mixing_rate"),
+                    jitter_prob=kwargs.get("jitter_prob"),
+                    use_feat_dynamic_real=kwargs.get("use_feat_dynamic_real"),
+                    jitter_sigma=kwargs.get("jitter_sigma"),
+                    scaling_prob=kwargs.get("scaling_prob"),
+                    scaling_sigma=kwargs.get("scaling_sigma"),
+                    rotation_prob=kwargs.get("rotation_prob"),
+                    permutation_prob=kwargs.get("permutation_prob"),
+                    permutation_max_segments=kwargs.get("permutation_max_segments"),
+                    permutation_seg_mode=kwargs.get("permutation_seg_mode"),
+                    magnitude_warp_prob=kwargs.get("magnitude_warp_prob"),
+                    magnitude_warp_sigma=kwargs.get("magnitude_warp_sigma"),
+                    magnitude_warp_knot=kwargs.get("magnitude_warp_knot"),
+                    time_warp_prob=kwargs.get("time_warp_prob"),
+                    time_warp_sigma=kwargs.get("time_warp_sigma"),
+                    time_warp_knot=kwargs.get("time_warp_knot"),
+                    window_slice_prob=kwargs.get("window_slice_prob"),
+                    window_slice_reduce_ratio=kwargs.get("window_slice_reduce_ratio"),
+                    window_warp_prob=kwargs.get("window_warp_prob"),
+                    window_warp_window_ratio=kwargs.get("window_warp_window_ratio"),
+                    window_warp_scales=kwargs.get("window_warp_scales"),
+                    use_kv_cache=kwargs.get("use_kv_cache"),
+                    data_id_to_name_map=kwargs.get("data_id_to_name_map"),
+                    use_cosine_annealing_lr=kwargs.get("use_cosine_annealing_lr"),
+                    cosine_annealing_lr_args=kwargs.get("cosine_annealing_lr_args"),
+                    track_loss_per_series=kwargs.get("track_loss_per_series"),
+                    mistral=kwargs.get("mistral"),
+                    alpha=kwargs.get("alpha"), # For empirical distribution
+                    # lora_config=kwargs.get("lora_config"),
+                )
+            model = cls(**mod)
+            inference_flag = kwargs.pop("inference", False)
+            if not inference_flag:
+                model.load_state_dict(checkpoint["state_dict"])
+            lora_config = kwargs.get("lora_config")
+            new_model = get_peft_model(model.model, lora_config)
+            model.model = new_model
+            if inference_flag:
+                print("Inference mode.....load peft checkpoint")
+                model.load_state_dict(checkpoint["state_dict"])
+            return model
+        else:
+            new_args = dict(
+            loss=kwargs.get("loss"),
+            lr=kwargs.get("lr"),
+            weight_decay=kwargs.get("weight_decay"),
+            context_length=kwargs.get("context_length"),
+            prediction_length=kwargs.get("prediction_length"),
+            model_kwargs=kwargs.get("model_kwargs"),
+            # Augmentations
+            aug_prob=kwargs.get("aug_prob"),
+            freq_mask_rate=kwargs.get("freq_mask_rate"),
+            freq_mixing_rate=kwargs.get("freq_mixing_rate"),
+            jitter_prob=kwargs.get("jitter_prob"),
+            use_feat_dynamic_real=kwargs.get("use_feat_dynamic_real"),
+            jitter_sigma=kwargs.get("jitter_sigma"),
+            scaling_prob=kwargs.get("scaling_prob"),
+            scaling_sigma=kwargs.get("scaling_sigma"),
+            rotation_prob=kwargs.get("rotation_prob"),
+            permutation_prob=kwargs.get("permutation_prob"),
+            permutation_max_segments=kwargs.get("permutation_max_segments"),
+            permutation_seg_mode=kwargs.get("permutation_seg_mode"),
+            magnitude_warp_prob=kwargs.get("magnitude_warp_prob"),
+            magnitude_warp_sigma=kwargs.get("magnitude_warp_sigma"),
+            magnitude_warp_knot=kwargs.get("magnitude_warp_knot"),
+            time_warp_prob=kwargs.get("time_warp_prob"),
+            time_warp_sigma=kwargs.get("time_warp_sigma"),
+            time_warp_knot=kwargs.get("time_warp_knot"),
+            window_slice_prob=kwargs.get("window_slice_prob"),
+            window_slice_reduce_ratio=kwargs.get("window_slice_reduce_ratio"),
+            window_warp_prob=kwargs.get("window_warp_prob"),
+            window_warp_window_ratio=kwargs.get("window_warp_window_ratio"),
+            window_warp_scales=kwargs.get("window_warp_scales"),
+            use_kv_cache=kwargs.get("use_kv_cache"),
+            data_id_to_name_map=kwargs.get("data_id_to_name_map"),
+            use_cosine_annealing_lr=kwargs.get("use_cosine_annealing_lr"),
+            cosine_annealing_lr_args=kwargs.get("cosine_annealing_lr_args"),
+            track_loss_per_series=kwargs.get("track_loss_per_series"),
+            mistral=kwargs.get("mistral"),
+            alpha=kwargs.get("alpha"),) # For empirical distribution
+            return super().load_from_checkpoint(checkpoint_path, map_location, hparams_file, strict, **new_args)
 
 
 class LagLlamaDALightningModule(pl.LightningModule):

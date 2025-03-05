@@ -1,3 +1,5 @@
+import numpy as np
+import matplotlib.pyplot as plt
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Iterable
@@ -448,6 +450,53 @@ class RMSNorm(nn.Module):
         x_normed = x * torch.rsqrt(norm_x + self.eps)
         return (self.scale * x_normed).type_as(x)
 
+class GradientMonitor:
+    def __init__(self):
+        self.gradients = []
+    
+    def hook_fn(self, grad):
+        # Store a copy of the gradient
+        self.gradients.append(grad.cpu().detach().numpy())
+
+
+class DetailedGradientMonitor:
+    def __init__(self, layer_name):
+        self.layer_name = layer_name
+        self.grad_means = []
+        self.grad_vars = []
+        self.grad_norms = []
+    
+    def hook_fn(self, grad):
+        # Calculate statistics
+        grad_np = grad.cpu().detach().numpy()
+        self.grad_means.append(np.mean(grad_np))
+        self.grad_vars.append(np.var(grad_np))
+        self.grad_norms.append(np.linalg.norm(grad_np))
+    
+    def plot_statistics(self, base_dir_to_save):
+        plt.figure(figsize=(15, 5))
+        
+        plt.subplot(131)
+        plt.plot(self.grad_means)
+        plt.title(f'{self.layer_name} Gradient Mean')
+        plt.xlabel('Iteration')
+        
+        plt.subplot(132)
+        plt.plot(self.grad_vars)
+        plt.title(f'{self.layer_name} Gradient Variance')
+        plt.xlabel('Iteration')
+        
+        plt.subplot(133)
+        plt.plot(self.grad_norms)
+        plt.title(f'{self.layer_name} Gradient L2 Norm')
+        plt.xlabel('Iteration')
+        
+        plt.tight_layout()
+        plt.savefig(f'{base_dir_to_save}/{self.layer_name}_grad_stats.png')
+
+watcher = DetailedGradientMonitor("LaplacianPE1")
+watcher2 = DetailedGradientMonitor("LaplacianPE2")
+
 
 class LagLlamaModel(nn.Module):
     def __init__(
@@ -515,6 +564,8 @@ class LagLlamaModel(nn.Module):
         self.y_cache = False  # used at time of inference when kv cached is used
         self.LaplacianPE1 = nn.Linear(32, 32)
         self.LaplacianPE2 = nn.Linear(32, 32)
+        self.LaplacianPE1.weight.register_hook(watcher.hook_fn)
+        self.LaplacianPE2.weight.register_hook(watcher2.hook_fn)
         self.act = nn.LeakyReLU()
 
 
