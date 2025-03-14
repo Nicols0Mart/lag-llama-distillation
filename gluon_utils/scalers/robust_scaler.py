@@ -22,7 +22,7 @@ from gluonts.torch.scaler import Scaler
 class RobustScaler(Scaler):
     """
     Computes a scaling factor by removing the median and scaling by the
-    interquartile range (IQR).
+    interquartile range (IQR) or, if IQR is 0, by the full range.
 
     Parameters
     ----------
@@ -61,9 +61,18 @@ class RobustScaler(Scaler):
             q3 = torch.nanquantile(observed_data, 0.75, dim=self.dim, keepdim=True)
             iqr = q3 - q1
 
+            # Compute full range as a fallback if IQR is 0
+            data_min = torch.nanquantile(observed_data, 0, dim=self.dim, keepdim=True)
+            data_max = torch.nanquantile(observed_data, 1, dim=self.dim, keepdim=True)
+            full_range = data_max - data_min
+
             # if observed data is all zeros, nanmedian returns nan
             loc = torch.where(torch.isnan(med), torch.zeros_like(med), med)
-            scale = torch.where(torch.isnan(iqr), torch.ones_like(iqr), iqr)
+            scale = torch.where(
+                torch.isnan(iqr),
+                torch.ones_like(iqr),
+                torch.where(iqr == 0, full_range, iqr)
+            )
             scale = torch.maximum(scale, torch.full_like(iqr, self.minimum_scale))
 
             scaled_data = (data - loc) / scale
