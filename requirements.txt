@@ -1,7 +1,7 @@
 gluonts[torch]
-torch>=2.0.0
+torch<=2.6.0
 wandb
 scipy
-pandas==2.2.3
+pandas==2.2.2
 huggingface_hub[cli]
 matplotlib
