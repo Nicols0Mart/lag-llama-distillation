@@ -130,33 +130,7 @@ see test_crowd.py
 | **Brussels** | Traffic Count | 207 | Brussels | 12,672 | Zero-shot |
 | **Crowd** | Pedestrian Count | 320 | Nanjing | 9,420 | Zero-shot |
 
-### Data Preparation
 
-```bash
-# Download and preprocess datasets
-python scripts/download_data.py --dataset PeMS-Bay
-python scripts/preprocess.py --dataset PeMS-Bay --normalize
-```
-
-## Experiments
-
-### Reproduction
-
-To reproduce the main results from the paper:
-
-```bash
-# Short-term forecasting
-python experiments/short_term.py --config configs/metr_la.yaml
-
-# Long-term forecasting  
-python experiments/long_term.py --config configs/pems07_long.yaml
-
-# Zero-shot evaluation
-python experiments/zero_shot.py --source PeMS04 --target Brussels
-
-# Domain adaptation
-python experiments/domain_adapt.py --source PeMS04 --target METR-LA
-```
 
 ### Hyperparameters
 
