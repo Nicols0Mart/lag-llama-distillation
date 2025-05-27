@@ -77,22 +77,31 @@ tqdm>=4.62.0
 ### Basic Usage
 
 ```python
-from gits_llm import GITSLLM, load_traffic_data
+from lag_llama.gluon.estimator import LagLlamaEstimator
 import torch
 
-# Load traffic data
-data = load_traffic_data('PeMS-Bay')
 
 # Initialize model
-model = GITSLLM(
-    num_nodes=325,
-    input_dim=1,
-    hidden_dim=256,
-    num_layers=6,
-    num_heads=8,
-    context_length=96,
-    prediction_horizon=12
+estimator = LagLlamaEstimator(
+    ckpt_path=None,
+    prediction_length=12,
+    context_length=48 * 2,
+    # estimator args
+    input_size=estimator_args["input_size"],
+    n_layer=estimator_args["n_layer"] * 4,
+    n_embd_per_head=estimator_args["n_embd_per_head"],
+    n_head=estimator_args["n_head"] * 2,
+    scaling=estimator_args["scaling"],
+    time_feat=estimator_args["time_feat"],
+    num_batches_per_epoch=350,
+    trainer_kwargs={
+        "max_epochs": 150,
+    },
+    use_feat_dynamic_real=True,
+    mistral=True,
+    alpha=0.9,
 )
+
 
 # Training
 model.fit(data['train'], epochs=150, batch_size=32)
@@ -103,20 +112,8 @@ predictions = model.predict(data['test'])
 
 ### Domain Adaptation
 
-```python
-# Pre-train on source domain
-source_data = load_traffic_data('PeMS04')
-model.fit(source_data['train'])
+see test_crowd.py
 
-# Adapt to target domain with LoRA
-target_data = load_traffic_data('METR-LA')
-model.adapt(
-    target_data['train'], 
-    rank=8, 
-    adaptation_epochs=50,
-    learning_rate=1e-4
-)
-```
 
 ## Datasets
 
