@@ -1,8 +1,5 @@
-gluonts[torch]<=0.14.4
-numpy>=1.23.5
-torch>=2.0.0
+gluonts[torch]
 wandb
 scipy
-pandas
 huggingface_hub[cli]
 matplotlib
