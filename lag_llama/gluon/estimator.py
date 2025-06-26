@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, Optional
 
 import lightning as L
 import torch
+import torch.nn.functional as F
 
 from gluonts.core.component import validated
 from gluonts.dataset.common import Dataset
@@ -159,6 +160,11 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
         device: torch.device = torch.device("cuda")
         if torch.cuda.is_available()
         else torch.device("cpu"),
+
+        distillation_teacher_estimator: Optional[PyTorchLightningEstimator] = None,
+        distillation_loss = F.mse_loss,
+        distillation_loss_weight: float = 0.0,
+        distillation_loss_temperature: float = 1.0,
     ) -> None:
         default_trainer_kwargs = {"max_epochs": 100}
         if trainer_kwargs is not None:
@@ -244,6 +250,11 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
         self.use_cosine_annealing_lr = use_cosine_annealing_lr
         self.cosine_annealing_lr_args = cosine_annealing_lr_args
         self.device = device
+
+        self.distillation_teacher_estimator = distillation_teacher_estimator
+        self.distillation_loss = distillation_loss
+        self.distillation_loss_weight = distillation_loss_weight
+        self.distillation_loss_temperature = distillation_loss_temperature
 
     @classmethod
     def derive_auto_fields(cls, train_iter):
@@ -339,6 +350,10 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                 cosine_annealing_lr_args=self.cosine_annealing_lr_args,
                 track_loss_per_series=self.track_loss_per_series,
                 nonnegative_pred_samples=self.nonnegative_pred_samples,
+                distillation_teacher_model = self.distillation_teacher_estimator.create_lightning_module() if self.distillation_teacher_estimator is not None else None,
+                distillation_loss=self.distillation_loss,
+                distillation_loss_weight=self.distillation_loss_weight,
+                distillation_loss_temperature=self.distillation_loss_temperature,
             )
         else:
             return LagLlamaLightningModule(
@@ -376,6 +391,10 @@ class LagLlamaEstimator(PyTorchLightningEstimator):
                 cosine_annealing_lr_args=self.cosine_annealing_lr_args,
                 track_loss_per_series=self.track_loss_per_series,
                 nonnegative_pred_samples=self.nonnegative_pred_samples,
+                distillation_teacher_model = self.distillation_teacher_estimator.create_lightning_module() if self.distillation_teacher_estimator is not None else None,
+                distillation_loss=self.distillation_loss,
+                distillation_loss_weight=self.distillation_loss_weight,
+                distillation_loss_temperature=self.distillation_loss_temperature,
             )
 
     def _create_instance_splitter(self, module: LagLlamaLightningModule, mode: str):

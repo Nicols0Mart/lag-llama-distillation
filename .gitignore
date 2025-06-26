@@ -173,3 +173,6 @@ notebooks
 datasets
 *ckpt
 *tar.gz
+
+# Ignore Lightning logs
+lightning_logs/

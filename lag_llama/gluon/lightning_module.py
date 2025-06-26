@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import random
+from typing import Optional
 
 import numpy as np
 import torch
@@ -98,6 +99,10 @@ class LagLlamaLightningModule(LightningModule):
         nonnegative_pred_samples: bool = False,
         use_kv_cache: bool = True,
         use_single_pass_sampling: bool = False,
+        distillation_teacher_model: Optional[LightningModule] = None,
+        distillation_loss = F.mse_loss,
+        distillation_loss_weight: float = 0.0,
+        distillation_loss_temperature: float = 1.0,
         **kwargs,
     ):
         super().__init__()
@@ -209,6 +214,16 @@ class LagLlamaLightningModule(LightningModule):
                     )
 
         self.augmentations = ApplyAugmentations(self.transforms)
+
+        # Distillation parameters
+        self.distillation_teacher_model = distillation_teacher_model
+        self.distillation_loss = distillation_loss
+        self.distillation_loss_weight = distillation_loss_weight
+        self.distillation_loss_temperature = distillation_loss_temperature
+
+        if self.distillation_teacher_model is not None:
+            self.distillation_teacher_model.freeze()
+            self.distillation_teacher_model.eval()
 
     # greedy prediction
     def forward(self, *args, **kwargs):
@@ -408,6 +423,107 @@ class LagLlamaLightningModule(LightningModule):
         else:
             return loss, observed_values
 
+    def _compute_distillation_loss(
+        self,
+        batch,
+        return_observed_values=False,
+        aggregate_by=torch.mean,
+        orignal_scale=True,
+    ):
+        # (bsz, model.context_length+max(model.lags_seq))
+        past_target = batch["past_target"]
+
+        # (bsz, model.context_length+max(model.lags_seq)) with 0s or 1s indicating available (1s) or missing (0s)
+        past_observed_values = batch["past_observed_values"]
+        # (bsz, model.prediction_length)
+        future_target = batch["future_target"]
+        # (bsz, model.prediction_length) with 0s or 1s indicating available (1s) or missing (0s)
+        future_observed_values = batch["future_observed_values"]
+        if self.time_feat:
+            past_time_feat = batch["past_time_feat"]
+            future_time_feat = batch["future_time_feat"]
+        else:
+            past_time_feat = None
+            future_time_feat = None
+
+        extra_dims = len(future_target.shape) - len(past_target.shape)  # usually 0
+        extra_shape = future_target.shape[:extra_dims]  # shape remains the same
+
+        repeats = prod(extra_shape)  # usually 1
+
+        # (bsz, model.context_length+max(model.lags_seq))
+        past_target = repeat_along_dim(past_target, 0, repeats)
+
+        # (bsz, model.context_length+max(model.lags_seq))
+        past_observed_values = repeat_along_dim(past_observed_values, 0, repeats)
+
+        # (bsz, model.prediction_length)
+        future_target_reshaped = future_target.reshape(
+            -1,
+            *future_target.shape[extra_dims + 1 :],
+        )
+        # (bsz, model.prediction_length)
+        future_observed_reshaped = future_observed_values.reshape(
+            -1,
+            *future_observed_values.shape[extra_dims + 1 :],
+        )
+
+        # distr_args is a tuple with two tensors of shape (bsz, context_length+pred_len-1)
+        distr_args, loc, scale = self.model(
+            past_target=past_target,
+            past_observed_values=past_observed_values,
+            past_time_feat=past_time_feat,
+            future_time_feat=future_time_feat,
+            future_target=future_target_reshaped,
+        )
+        # (bsz, context_length-1) # Basically removes the first value since it cannot be predicted
+        context_target = take_last(past_target, dim=-1, num=self.context_length - 1)
+        # (bsz, context_length-1+pred_len) # values that can be predicted
+        target = torch.cat((context_target, future_target_reshaped), dim=1)
+        # same as context_target, but for observed_values tensor
+        context_observed = take_last(
+            past_observed_values, dim=-1, num=self.context_length - 1
+        )
+        # same as target but for observed_values tensor
+        observed_values = torch.cat((context_observed, future_observed_reshaped), dim=1)
+
+        if orignal_scale:
+            loss_values = self.model.distr_output.loss(target, distr_args, loc, scale)
+        else:
+            loss_values = self.model.distr_output.loss(
+                (target - loc) / scale, distr_args
+            )
+        loss_values = loss_values * observed_values.clamp_min(1)
+
+        student_loss = aggregate_by(
+            loss_values,
+            dim=tuple(range(extra_dims + 1, len(future_target.shape))),
+        )
+
+        with torch.no_grad():
+            t_distr_args, t_loc, t_scale = self.distillation_teacher_model.model(
+                past_target=past_target,
+                past_observed_values=past_observed_values,
+                past_time_feat=past_time_feat,
+                future_time_feat=future_time_feat,
+                future_target=future_target_reshaped,
+            )
+
+        # Distribution parameters MSE loss
+        loc_loss = self.distillation_loss(loc, t_loc)
+
+        scale_loss =  self.distillation_loss(scale, t_scale)
+
+        df_student = distr_args[0]  # degrees of freedom
+        df_teacher = t_distr_args[0]
+        df_loss = self.distillation_loss(df_student, df_teacher)
+
+        if not return_observed_values:
+            return student_loss, loc_loss, scale_loss, df_loss
+        else:
+            return student_loss, loc_loss, scale_loss, df_loss, observed_values
+
+
     def training_step(self, batch, batch_idx: int):  # type: ignore
         """
         Execute training step.
@@ -432,16 +548,31 @@ class LagLlamaLightningModule(LightningModule):
                     batch["past_target"], batch["future_target"]
                 )
 
-        train_loss_avg = self._compute_loss(batch, return_observed_values=False)
 
-        self.log(
-            "train_loss",
-            train_loss_avg.mean(),
-            on_epoch=True,
-            on_step=False,
-            prog_bar=False,
-        )
-        return train_loss_avg.mean()
+        if self.distillation_teacher_model is not None:
+            student_loss, loc_loss, scale_loss, df_loss = self._compute_distillation_loss(batch, return_observed_values=False)
+            distillation_loss = loc_loss + scale_loss + df_loss
+            total_loss = (1.0 - self.distillation_loss_weight) * student_loss + self.distillation_loss_weight * distillation_loss
+            self.log("student_loss", student_loss.mean(), on_epoch=True, on_step=False, prog_bar=False)
+            self.log("loc_loss", loc_loss.mean(), on_epoch=True, on_step=False, prog_bar=True)
+            self.log("scale_loss", scale_loss.mean(), on_epoch=True, on_step=False, prog_bar=True)
+            self.log("df_loss", df_loss.mean(), on_epoch=True, on_step=False, prog_bar=True)
+            self.log("distillation_loss", distillation_loss.mean(), on_epoch=True, on_step=False, prog_bar=False)
+            self.log("train_loss", total_loss.mean(), on_epoch=True, on_step=False, prog_bar=False)
+            return total_loss.mean()
+        else:
+            train_loss_avg = self._compute_loss(batch, return_observed_values=False)
+
+            self.log(
+                "train_loss",
+                train_loss_avg.mean(),
+                on_epoch=True,
+                on_step=False,
+                prog_bar=True,
+            )
+            return train_loss_avg.mean()
+        
+
 
     def on_train_epoch_end(self):
         # Log all losses
